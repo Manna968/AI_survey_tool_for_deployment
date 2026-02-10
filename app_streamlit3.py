@@ -19,6 +19,12 @@ from survey_template_0209 import (
     canonical_option_key,
 )
 
+def do_rerun():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
 LIB_PATH = "Question_Rates_Merged_backbone_ready.xlsx"
 
 @st.cache_data
@@ -420,7 +426,7 @@ def render_reorder_ui(payload: dict, *, selected_qid: str) -> None:
 
     st.session_state.payload = new_payload
     st.session_state.logs.append(f"✅ Reordered options in Q{selected_qid}.")
-    st.rerun()
+    do_rerun()
 
 
 
@@ -985,50 +991,50 @@ def apply_command(payload, ctx, client, cmd: str):
     # -----------------------
     # reorder/move (existing)
     # -----------------------
-    if low.startswith("moveopt "):
-        parts = cmd.split()
-        if len(parts) != 4:
-            return payload, "Usage: moveopt <qid> <from_idx> <to_idx> (1-based)"
-        it = _find_item(payload, parts[1])
-        if not it:
-            return payload, "No question found."
-        labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-        try:
-            a = int(parts[2]) - 1
-            b = int(parts[3]) - 1
-        except Exception:
-            return payload, "Indices must be integers."
-        if not (0 <= a < len(labels) and 0 <= b < len(labels)):
-            return payload, f"Index out of range (1..{len(labels)})"
-        new_payload = copy.deepcopy(payload)
-        it2 = _find_item(new_payload, parts[1])
-        labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-        x = labels2.pop(a)
-        labels2.insert(b, x)
-        _set_options_from_labels(it2, labels2)
-        return new_payload, f"✅ Moved option {parts[2]} → {parts[3]} for Q{parts[1]}."
+    # if low.startswith("moveopt "):
+    #     parts = cmd.split()
+    #     if len(parts) != 4:
+    #         return payload, "Usage: moveopt <qid> <from_idx> <to_idx> (1-based)"
+    #     it = _find_item(payload, parts[1])
+    #     if not it:
+    #         return payload, "No question found."
+    #     labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
+    #     try:
+    #         a = int(parts[2]) - 1
+    #         b = int(parts[3]) - 1
+    #     except Exception:
+    #         return payload, "Indices must be integers."
+    #     if not (0 <= a < len(labels) and 0 <= b < len(labels)):
+    #         return payload, f"Index out of range (1..{len(labels)})"
+    #     new_payload = copy.deepcopy(payload)
+    #     it2 = _find_item(new_payload, parts[1])
+    #     labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
+    #     x = labels2.pop(a)
+    #     labels2.insert(b, x)
+    #     _set_options_from_labels(it2, labels2)
+    #     return new_payload, f"✅ Moved option {parts[2]} → {parts[3]} for Q{parts[1]}."
 
-    if low.startswith("reorderopts "):
-        parts = cmd.split(" ", 2)
-        if len(parts) != 3:
-            return payload, "Usage: reorderopts <qid> <idx1,idx2,...> (1-based)"
-        qid = parts[1].strip()
-        it = _find_item(payload, qid)
-        if not it:
-            return payload, "No question found."
-        labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-        try:
-            order = [int(x.strip()) - 1 for x in parts[2].split(",")]
-        except Exception:
-            return payload, "Bad index list."
-        if sorted(order) != list(range(len(labels))):
-            return payload, f"Must include each index exactly once (1..{len(labels)})"
-        new_payload = copy.deepcopy(payload)
-        it2 = _find_item(new_payload, qid)
-        labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-        new_labels = [labels2[i] for i in order]
-        _set_options_from_labels(it2, new_labels)
-        return new_payload, f"✅ Reordered options for Q{qid}."
+    # if low.startswith("reorderopts "):
+    #     parts = cmd.split(" ", 2)
+    #     if len(parts) != 3:
+    #         return payload, "Usage: reorderopts <qid> <idx1,idx2,...> (1-based)"
+    #     qid = parts[1].strip()
+    #     it = _find_item(payload, qid)
+    #     if not it:
+    #         return payload, "No question found."
+    #     labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
+    #     try:
+    #         order = [int(x.strip()) - 1 for x in parts[2].split(",")]
+    #     except Exception:
+    #         return payload, "Bad index list."
+    #     if sorted(order) != list(range(len(labels))):
+    #         return payload, f"Must include each index exactly once (1..{len(labels)})"
+    #     new_payload = copy.deepcopy(payload)
+    #     it2 = _find_item(new_payload, qid)
+    #     labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
+    #     new_labels = [labels2[i] for i in order]
+    #     _set_options_from_labels(it2, new_labels)
+    #     return new_payload, f"✅ Reordered options for Q{qid}."
 
     # -----------------------
     # LLM rewrite (existing)
@@ -1463,8 +1469,6 @@ with tab_console:
 
     # --- Command catalog (UI only) ---
     RULE_BASED = [
-        ("moveopt <qid> <from_idx> <to_idx>", "Move an option (1-based)"),
-        ("reorderopts <qid> <idx1,idx2,...>", "Reorder options by index (1-based)"),
         ("editq <qid> | <new question text>", "Edit question text"),
         ("addq after <qid> | <question_text> | <opt1; opt2; ...>", "Insert a new manual question after Q<qid>"),
         ("addq end | <question_text> | <opt1; opt2; ...>", "Append a new manual question"),
