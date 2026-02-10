@@ -348,16 +348,16 @@ def _set_options_from_labels(it, labels):
         out.append({"key": k, "label": lab})
     it["answer_options"] = out
 
-def render_reorder_ui(it: dict, *, qid: str):
-    """
-    UI to reorder answer options without commands.
-    Uses ▲/▼ buttons and applies by rebuilding answer_options with stable keys.
-    """
-    if (it.get("question_type") or "").strip() == "OpenText":
-        st.info("OpenText questions have no answer options to reorder.")
+def render_reorder_ui(payload: dict, *, selected_qid: str) -> None:
+    """UI to reorder answer options for one question (no commands)."""
+    import pandas as pd  # local import so you don't need top-level pandas import
+
+    it = _find_item(payload, selected_qid)
+    if not it:
+        st.error("Reorder: question not found.")
         return
 
-    # current labels
+    # Only for questions with options
     labels = [
         o.get("label")
         for o in (it.get("answer_options") or [])
@@ -366,59 +366,62 @@ def render_reorder_ui(it: dict, *, qid: str):
     labels = _dedupe_labels_preserve_order(labels)
 
     if len(labels) < 2:
-        st.info("Not enough options to reorder.")
+        st.info("Reorder: not enough options to reorder.")
         return
 
-    wk_key = f"reorder_working_{qid}"
+    st.markdown("### Reorder options")
 
-    # initialize working order from current labels if needed
-    if wk_key not in st.session_state:
-        st.session_state[wk_key] = labels[:]
+    # Build an editable table: users set Order numbers
+    df0 = pd.DataFrame({"Order": list(range(1, len(labels) + 1)), "Option": labels})
 
-    # If options changed elsewhere (AI rewrite, manual add/delete), refresh working list
-    if _dedupe_labels_preserve_order(st.session_state[wk_key]) != labels:
-        st.session_state[wk_key] = labels[:]
+    editor_key = f"reorder_editor_{selected_qid}"
+    edited = st.data_editor(
+        df0,
+        key=editor_key,
+        hide_index=True,
+        num_rows="fixed",
+        disabled=["Option"],  # only allow editing Order
+        use_container_width=True,
+    )
 
-    working = st.session_state[wk_key]
+    c1, c2 = st.columns([1, 2])
+    with c1:
+        apply_btn = st.button("Apply order", key=f"apply_reorder_{selected_qid}")
+    with c2:
+        st.caption("Edit the **Order** values (1..N), then click **Apply order**.")
 
-    with st.expander("Reorder answer options (no commands)", expanded=False):
-        st.caption("Use ▲/▼ to change order, then click Apply.")
+    if not apply_btn:
+        return
 
-        for i, lab in enumerate(working):
-            c1, c2, c3 = st.columns([8, 1, 1])
-            c1.write(f"{i+1}. {lab}")
+    # Validate + apply
+    try:
+        orders = [int(x) for x in edited["Order"].tolist()]
+    except Exception:
+        st.error("Order must be integers.")
+        return
 
-            if c2.button("▲", key=f"btn_up_{qid}_{i}", disabled=(i == 0)):
-                working[i-1], working[i] = working[i], working[i-1]
-                st.session_state[wk_key] = working
-                st.rerun()
+    n = len(labels)
+    if sorted(orders) != list(range(1, n + 1)):
+        st.error(f"Order must contain each number exactly once: 1..{n}.")
+        return
 
-            if c3.button("▼", key=f"btn_down_{qid}_{i}", disabled=(i == len(working) - 1)):
-                working[i+1], working[i] = working[i], working[i+1]
-                st.session_state[wk_key] = working
-                st.rerun()
+    # Create the new label order
+    pairs = list(zip(orders, edited["Option"].tolist()))
+    pairs.sort(key=lambda x: x[0])
+    new_labels = [lab for _, lab in pairs]
 
-        a1, a2, a3 = st.columns([1, 1, 6])
-        if a1.button("Apply order", key=f"btn_apply_order_{qid}"):
-            new_payload = copy.deepcopy(st.session_state.payload)
-            it2 = _find_item(new_payload, qid)
+    # Update payload in session state
+    new_payload = copy.deepcopy(st.session_state.payload)
+    it2 = _find_item(new_payload, selected_qid)
+    _set_options_from_labels(it2, new_labels)
 
-            # apply order
-            _set_options_from_labels(it2, st.session_state[wk_key])
+    it2.setdefault("ai_actions", {})
+    it2["ai_actions"]["reordered_by_user"] = True
 
-            st.session_state.payload = new_payload
-            st.session_state.history.append(f"[UI] reorder options for Q{qid}")
-            st.session_state.logs.append(f"✅ Reordered options for Q{qid}.")
-            st.rerun()
+    st.session_state.payload = new_payload
+    st.session_state.logs.append(f"✅ Reordered options in Q{selected_qid}.")
+    st.rerun()
 
-        if a2.button("Reset", key=f"btn_reset_order_{qid}"):
-            st.session_state[wk_key] = labels[:]
-            st.rerun()
-
-        # Optional convenience: reverse
-        if a3.button("Reverse order", key=f"btn_reverse_order_{qid}"):
-            st.session_state[wk_key] = list(reversed(working))
-            st.rerun()
 
 
 
