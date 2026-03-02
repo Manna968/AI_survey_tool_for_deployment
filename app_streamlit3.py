@@ -3,21 +3,152 @@ import json
 import streamlit as st
 import re
 import copy
-from typing import List
 from typing import List, Optional, Any, Dict
+
+# ------------------------------------------------------------
+# Streamlit config (MUST be the first st.* call)
+# ------------------------------------------------------------
+st.set_page_config(page_title="Arrival Survey Builder", layout="wide")
+st.title("Arrival Survey Builder (Internal)")
 
 # Import from your existing script file:
 from survey_template_0209 import (
-    load_library,
-    build_arrival,
-    neat_preview,
-    BuilderContext,
-    make_client,
-    rewrite_question_text_openai,
-    rewrite_answer_options_openai,
-    var_name_for_slot,
-    canonical_option_key,
+    load_library, build_arrival, neat_preview, BuilderContext, make_client,
+    rewrite_question_text_openai, rewrite_answer_options_openai,
+    var_name_for_slot, canonical_option_key,
+    plan_l2_followups_openai, build_l2_condition, _ensure_closed_ended,
 )
+
+# ------------------------------------------------------------
+# Helpers
+# ------------------------------------------------------------
+
+VALID_QTYPES = {
+    "SingleSelection", "MultiSelection",
+    "SingleSelectionWithOther", "MultiSelectionWithOther",
+    "OpenText",
+}
+
+def normalize_qtype(qtype: str) -> str:
+    qt = (qtype or "").strip()
+    if not qt:
+        return "SingleSelection"
+    m = {
+        "singleselect": "SingleSelection",
+        "single_select": "SingleSelection",
+        "single": "SingleSelection",
+        "multiselect": "MultiSelection",
+        "multi_select": "MultiSelection",
+        "multi": "MultiSelection",
+        "opentext": "OpenText",
+        "open_text": "OpenText",
+        "open": "OpenText",
+        "text": "OpenText",
+    }
+    qt2 = m.get(qt.lower(), qt)
+    return qt2 if qt2 in VALID_QTYPES else "SingleSelection"
+
+def l2_fingerprint(parent_qid: str, draft: dict) -> str:
+    trig = ",".join(sorted([str(x) for x in (draft.get("trigger_answer_keys") or [])]))
+    qtext = (draft.get("question_text") or "").strip()
+    qtype = (draft.get("question_type") or "").strip()
+    base = f"{parent_qid}||{trig}||{qtype}||{qtext}"
+    return slugify(base)[:80]
+
+
+def generate_l2_from_user_requirements(
+    client: Any,
+    *,
+    ctx: Any,                       # BuilderContext
+    parent_it: Dict[str, Any],      # parent item dict
+    trigger_keys: List[str],        # keys selected by user
+    requirements: str,              # user text
+    desired_qtype: str,             # normalized canonical qtype
+) -> Dict[str, Any]:
+    """
+    Returns a 'draft' dict compatible with your build_l2_item_from_draft():
+      {
+        "trigger_answer_keys": [...],
+        "question_text": "...",
+        "question_type": "SingleSelection|MultiSelection|OpenText",
+        "answer_options": [...],
+        "why": "..."
+      }
+    """
+    parent_q = (parent_it.get("question_text") or "").strip()
+
+    # Map keys -> labels for context
+    key_to_label = {
+        o.get("key"): o.get("label")
+        for o in (parent_it.get("answer_options") or [])
+        if isinstance(o, dict) and (o.get("key") or "").strip()
+    }
+    trigger_labels = [key_to_label.get(k, k) for k in trigger_keys]
+
+    # 1) Draft question text (use rewrite_question_text_openai to keep consistent w your system)
+    prompt_seed = (
+        f"Create an L2 follow-up question shown only when the user selected: {', '.join(trigger_labels)}.\n"
+        f"Parent question: {parent_q}\n"
+        f"Requirements: {requirements}\n"
+        f"Desired question type: {desired_qtype}\n"
+    )
+    instruction_q = (
+        "Write ONE concise follow-up (L2) survey question.\n"
+        "- Must be answerable in <=10 seconds.\n"
+        "- Must directly relate to the selected parent answer(s).\n"
+        "- Must NOT drift into a different construct than the parent question.\n"
+        "- Avoid analytics/trackable topics (device/referrer/browser/time on site/pages/clicks).\n"
+        "- Do not mention internal keys or 'selected answer'.\n"
+    )
+
+    l2_text = rewrite_question_text_openai(
+        client,
+        site_purpose=ctx.site_purpose,
+        survey_goal=ctx.survey_goal,
+        site_category=ctx.site_category,
+        original_question_text=prompt_seed,
+        instruction=instruction_q,
+    ).strip()
+
+    # 2) Draft options (if closed-ended)
+    if desired_qtype == "OpenText":
+        return {
+            "trigger_answer_keys": trigger_keys,
+            "question_text": l2_text,
+            "question_type": "OpenText",
+            "answer_options": [],
+            "why": f"user_requirements: {requirements}",
+        }
+
+    seed_opts = ["Option A", "Option B", "Other"]
+    instruction_o = (
+        "Generate answer options for the L2 follow-up question.\n"
+        "- Return 2–6 options.\n"
+        "- Short labels only.\n"
+        "- Mutually exclusive where possible.\n"
+        "- Include 'Other' only if useful.\n"
+        f"Follow-up question: {l2_text}\n"
+    )
+
+    l2_opts = rewrite_answer_options_openai(
+        client,
+        site_purpose=ctx.site_purpose,
+        survey_goal=ctx.survey_goal,
+        site_category=ctx.site_category,
+        question_text=l2_text,
+        original_options=seed_opts,
+        instruction=instruction_o,
+        keep_other_if_present=True,
+    )
+    l2_opts = _dedupe_labels_preserve_order([str(x) for x in (l2_opts or [])])[:8]
+
+    return {
+        "trigger_answer_keys": trigger_keys,
+        "question_text": l2_text,
+        "question_type": desired_qtype,
+        "answer_options": l2_opts,
+        "why": f"user_requirements: {requirements}",
+    }
 
 def do_rerun():
     if hasattr(st, "rerun"):
@@ -25,24 +156,383 @@ def do_rerun():
     else:
         st.experimental_rerun()
 
+def slugify(s: str) -> str:
+    s = (s or "").strip().lower()
+    s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
+    return s or "opt"
+
+def _find_item(payload, qid: str):
+    for it in payload.get("items", []):
+        if str(it.get("id")) == str(qid):
+            return it
+    return None
+
+def _dedupe_labels_preserve_order(labels):
+    seen = set()
+    out = []
+    for x in labels:
+        t = (x or "").strip()
+        if not t:
+            continue
+        n = re.sub(r"\s+", " ", t.lower())
+        if n in seen:
+            continue
+        seen.add(n)
+        out.append(t)
+    return out
+
+def _get_candidates_block(it: dict) -> dict:
+    """
+    Backward-compatible reader for ai_actions["option_candidates"].
+
+    Supports BOTH:
+      A) list[str]                           (legacy)
+      B) {"generated": [...], "selected": [...], "max_select": 8} (new)
+
+    Returns:
+      {"generated": List[str], "selected": List[str], "max_select": int}
+    """
+    ai = it.get("ai_actions") or {}
+    raw = ai.get("option_candidates")
+
+    generated: List[str] = []
+    selected: List[str] = []
+    max_select = 8
+
+    # Case A: legacy list[str]
+    if isinstance(raw, list):
+        generated = [str(x).strip() for x in raw if x and str(x).strip()]
+        return {"generated": generated, "selected": [], "max_select": max_select}
+
+    # Case B: new dict
+    if isinstance(raw, dict):
+        generated = raw.get("generated") or []
+        selected = raw.get("selected") or []
+        max_select = int(raw.get("max_select") or 8)
+
+        generated = [str(x).strip() for x in generated if x and str(x).strip()]
+        selected = [str(x).strip() for x in selected if x and str(x).strip()]
+        return {"generated": generated, "selected": selected, "max_select": max_select}
+
+    return {"generated": [], "selected": [], "max_select": max_select}
+
+def _set_candidates_block(it: dict, *, generated: list, selected: list = None, max_select: int = 8) -> None:
+    it.setdefault("ai_actions", {})
+    it["ai_actions"]["option_candidates"] = {
+        "generated": [x for x in (generated or []) if x and str(x).strip()],
+        "selected": [x for x in (selected or []) if x and str(x).strip()] if selected is not None else [],
+        "max_select": int(max_select),
+    }
+
+def _set_options_from_labels(it, labels):
+    slot = it.get("slot", "")
+    labels = _dedupe_labels_preserve_order(labels)
+    used = set()
+    out = []
+    for lab in labels:
+        base = canonical_option_key(slot, lab)
+        k = base
+        i = 2
+        while k in used:
+            k = f"{base}_{i}"
+            i += 1
+        used.add(k)
+        out.append({"key": k, "label": lab})
+    it["answer_options"] = out
+
+def build_l2_item_from_draft(
+    *,
+    parent_item: Dict[str, Any],
+    draft: Dict[str, Any],
+    new_id: str,
+) -> Dict[str, Any]:
+    """
+    Convert one L2 draft (from ai_actions["l2_suggestions"]["drafts"][i]) into a real payload item.
+    """
+    pslot = str(parent_item.get("slot") or "")
+    plevel = str(parent_item.get("level") or "L1")
+    parent_var = var_name_for_slot(pslot, plevel)
+    parent_qtype = str(parent_item.get("question_type") or "SingleSelect")
+
+    trigger_keys = [str(x).strip() for x in (draft.get("trigger_answer_keys") or []) if str(x).strip()]
+
+    # condition JSON for L2 display
+    cond = build_l2_condition(parent_var, parent_qtype, trigger_keys)
+
+    qtype = str(draft.get("question_type") or "SingleSelect")
+    # normalize common variants
+    qtype = qtype.replace("SingleSelection", "SingleSelect").replace("MultiSelection", "MultiSelect")
+
+    qtext = str(draft.get("question_text") or "").strip()
+    opts = list(draft.get("answer_options") or [])
+
+    # ensure closed-ended questions have options (uses template helper)
+    qtype, opts = _ensure_closed_ended(qtype, opts)
+
+    item = {
+        "id": str(new_id),
+        "module_key": "l2_followup",
+        "construct": "l2_followup",
+        "slot": pslot,
+        "phase": "Arrival",
+        "level": "L2",
+        "question_id": f"llm_l2::{pslot}::{slugify(','.join(trigger_keys))}",
+        "question_type": qtype,
+        "question_text": qtext,
+        "answer_options": [],
+        "display_condition_json": cond,
+        "display_condition": "",
+        "ai_actions": {
+            "draft": True,
+            "source": "l2_suggestions_ui",
+            "trigger_answer_keys": trigger_keys,
+            "why": str(draft.get("why") or ""),
+        },
+    }
+
+    if qtype != "OpenText":
+        opts = _dedupe_labels_preserve_order([str(x) for x in opts])
+        _set_options_from_labels(item, opts[:8])
+
+    return item
+
+def render_reorder_ui(payload: dict, *, selected_qid: str) -> None:
+    it = _find_item(payload, selected_qid)
+    if not it:
+        st.error("Reorder: question not found.")
+        return
+
+    labels = [
+        o.get("label")
+        for o in (it.get("answer_options") or [])
+        if isinstance(o, dict) and (o.get("label") or "").strip()
+    ]
+    labels = _dedupe_labels_preserve_order(labels)
+
+    if len(labels) < 2:
+        st.info("Reorder: not enough options to reorder.")
+        return
+
+    st.markdown("### Reorder options")
+
+    state_key = f"reorder_working_{selected_qid}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = labels
+
+    working = st.session_state[state_key]
+
+    for i, lab in enumerate(working):
+        c1, c2, c3, c4 = st.columns([6, 1, 1, 2])
+        with c1:
+            st.write(lab)
+        with c2:
+            up = st.button("⬆️", key=f"up_{selected_qid}_{i}", disabled=(i == 0))
+        with c3:
+            down = st.button("⬇️", key=f"down_{selected_qid}_{i}", disabled=(i == len(working) - 1))
+        with c4:
+            pass
+
+        if up:
+            working[i - 1], working[i] = working[i], working[i - 1]
+            st.session_state[state_key] = working
+            st.rerun()
+
+        if down:
+            working[i + 1], working[i] = working[i], working[i + 1]
+            st.session_state[state_key] = working
+            st.rerun()
+
+    colA, colB, colC = st.columns([1, 1, 2])
+    with colA:
+        if st.button("✅ Save order", key=f"save_reorder_{selected_qid}"):
+            new_payload = copy.deepcopy(st.session_state.payload)
+            it2 = _find_item(new_payload, selected_qid)
+            _set_options_from_labels(it2, st.session_state[state_key])
+
+            it2.setdefault("ai_actions", {})
+            it2["ai_actions"]["reordered_by_user"] = True
+
+            st.session_state.payload = new_payload
+            st.session_state.logs.append(f"✅ Reordered options in Q{selected_qid}.")
+            st.rerun()
+
+    with colB:
+        if st.button("↩️ Reset", key=f"reset_reorder_{selected_qid}"):
+            st.session_state[state_key] = labels
+            st.rerun()
+
+    with colC:
+        st.caption("Use ⬆️ / ⬇️ to reorder. Click **Save order** to apply.")
+
+def suggest_options_for_item(
+    client: Any,
+    *,
+    ctx: Any,              # BuilderContext
+    it: Dict[str, Any],    # item dict from payload
+    instruction: str = "",
+    n: int = 12,
+) -> List[str]:
+    qtext = (it.get("question_text") or "").strip()
+    if not qtext:
+        return []
+
+    orig_opts = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
+    seed = orig_opts if orig_opts else ["Option A", "Option B", "Other"]
+
+    base_instruction = (
+        "Propose a candidate pool of answer options (do NOT rewrite the question). "
+        "Return short option labels only. "
+        "Make them mutually exclusive where possible. "
+        "Avoid pharma/healthcare wording unless the site category is Pharma. "
+        "Include 'Other' only if useful."
+    )
+    if instruction.strip():
+        base_instruction += " " + instruction.strip()
+
+    cands = rewrite_answer_options_openai(
+        client,
+        site_purpose=ctx.site_purpose,
+        survey_goal=ctx.survey_goal,
+        site_category=ctx.site_category,
+        question_text=qtext,
+        original_options=seed,
+        instruction=base_instruction,
+        keep_other_if_present=True,
+    )
+
+    cands = _dedupe_labels_preserve_order(cands)[: max(8, min(16, n))]
+    return cands
+
+def _split_pipe(cmd: str, expected_parts: int):
+    parts = [p.strip() for p in cmd.split("|")]
+    if len(parts) < expected_parts:
+        return None
+    head = parts[0]
+    tail = parts[1:]
+    while len(tail) > expected_parts - 1:
+        tail[-2] = tail[-2] + " | " + tail[-1]
+        tail.pop()
+    return [head] + tail
+
+def _bullet_join(xs: List[str]) -> str:
+    xs = [x.strip() for x in (xs or []) if x and x.strip()]
+    if not xs:
+        return ""
+    if len(xs) == 1:
+        return xs[0]
+    if len(xs) == 2:
+        return f"{xs[0]} and {xs[1]}"
+    return ", ".join(xs[:-1]) + f", and {xs[-1]}"
+
+def compose_site_purpose(
+    *,
+    site_name: str,
+    site_type: str,
+    primary_audience: List[str],
+    domain_topic: str,
+    core_value: str,
+    primary_actions: List[str],
+    extra_context: str,
+) -> str:
+    aud = _bullet_join(primary_audience) or "visitors"
+    domain = domain_topic.strip()
+    value = core_value.strip()
+    actions = _bullet_join(primary_actions)
+
+    parts = []
+    if site_name.strip():
+        parts.append(f"{site_name.strip()} is a {site_type.strip().lower()} site")
+    else:
+        parts.append(f"A {site_type.strip().lower()} site")
+
+    parts.append(f"for {aud.lower()}")
+
+    if domain:
+        parts.append(f"focused on {domain}")
+
+    if value:
+        parts.append(f"that helps users {value}")
+    elif actions:
+        parts.append(f"that helps users {actions.lower()}")
+
+    s = " ".join(parts).strip()
+    if not s.endswith("."):
+        s += "."
+    if extra_context.strip():
+        ec = extra_context.strip()
+        if not ec.endswith("."):
+            ec += "."
+        s += f" {ec}"
+    return s
+
+def compose_survey_goal(
+    *,
+    goal_type: str,
+    goal_details: str,
+    identify_roles: bool,
+    capture_intent: bool,
+    measure_satisfaction: bool,
+    find_blockers: bool,
+    gauge_readiness: bool,
+    desired_next_steps: List[str],
+    dont_ask: List[str],
+    max_questions_hint: str,
+) -> str:
+    objectives = []
+
+    primary = goal_type.strip()
+    if primary:
+        objectives.append(primary)
+
+    if identify_roles:
+        objectives.append("understand who’s visiting")
+    if capture_intent:
+        objectives.append("understand what they’re trying to do / find")
+    if measure_satisfaction:
+        objectives.append("measure satisfaction")
+    if find_blockers:
+        objectives.append("identify blockers or confusion")
+    if gauge_readiness:
+        objectives.append("understand readiness / next step")
+
+    steps = _bullet_join(desired_next_steps)
+    if steps:
+        objectives.append(f"and how close they are to {steps.lower()}")
+
+    detail = goal_details.strip()
+    if detail:
+        objectives.append(f"Context: {detail}")
+
+    neg_map = {
+        "journey_stage": "Don't ask journey stage.",
+        "prior_knowledge": "Don't ask familiarity/prior knowledge.",
+        "trigger": "Don't ask trigger.",
+    }
+    neg_lines = [neg_map[k] for k in dont_ask if k in neg_map]
+
+    mq = max_questions_hint.strip()
+    if mq:
+        objectives.append(mq)
+
+    base = "Survey goal: " + "; ".join([o for o in objectives if o])
+    if not base.endswith("."):
+        base += "."
+    if neg_lines:
+        base += " " + " ".join(neg_lines)
+    return base
+
+# ------------------------------------------------------------
+# Cached library load
+# ------------------------------------------------------------
 LIB_PATH = "Question_Rates_Merged_backbone_ready.xlsx"
 
-@st.cache_data
-def get_df():
-    return load_library(LIB_PATH)
-
-df = get_df()
-
-# ------------------------------------------------------------
-# Streamlit config (ONLY ONCE, MUST BE FIRST st.* call)
-# ------------------------------------------------------------
-st.set_page_config(page_title="Arrival Survey Builder", layout="wide")
-st.title("Arrival Survey Builder (Internal)")
+@st.cache_data(show_spinner=False)
+def cached_load_library(path: str):
+    return load_library(path)
 
 # ------------------------------------------------------------
 # Session state
 # ------------------------------------------------------------
-
 if "payload" not in st.session_state:
     st.session_state.payload = None
 if "client" not in st.session_state:
@@ -54,20 +544,15 @@ if "logs" not in st.session_state:
 if "history" not in st.session_state:
     st.session_state.history = []
 if "option_suggestions" not in st.session_state:
-    # { qid(str): {"candidates": [labels...], "selected": [labels...], "instruction": str} }
     st.session_state.option_suggestions = {}
-
 if "last_suggest_qid" not in st.session_state:
     st.session_state.last_suggest_qid = None
-
-# Used to detect category changes and reset dependent widgets
 if "last_site_category" not in st.session_state:
     st.session_state.last_site_category = None
 
 # -----------------------
-# Small helpers (UI-side only)
+# UI options
 # -----------------------
-
 def get_ui_options(site_category: str) -> dict:
     cat = (site_category or "").strip().lower()
 
@@ -171,7 +656,6 @@ def get_ui_options(site_category: str) -> dict:
             "extra_context_placeholder": "Constraints (e.g., compliance tone; avoid claims)…",
         }
 
-    # Default = Ecommerce (or “Other”)
     return {
         "primary_audience": [
             "Individual consumer",
@@ -197,9 +681,7 @@ def get_ui_options(site_category: str) -> dict:
         "extra_context_placeholder": "Constraints, tone, things to avoid…",
     }
 
-
 def reset_multiselect_if_invalid(state_key: str, valid_options: list):
-    """If session_state has selections no longer in valid_options, drop invalid selections."""
     cur = st.session_state.get(state_key, [])
     if not cur:
         return
@@ -207,404 +689,20 @@ def reset_multiselect_if_invalid(state_key: str, valid_options: list):
     if cur2 != cur:
         st.session_state[state_key] = cur2
 
-
 def hard_reset_on_category_change(new_category: str):
-    """
-    When site_category changes, clear dependent selections so UI feels "dynamic"
-    and users don't carry Ecommerce picks into Education.
-    """
     prev = st.session_state.get("last_site_category")
     if prev is None:
         st.session_state.last_site_category = new_category
         return
 
     if prev != new_category:
-        # Clear dependent widget state
         st.session_state.primary_audience = []
         st.session_state.primary_actions = []
-        # Optional: clear text inputs if you want a full reset
-        # st.session_state.domain_topic = ""
-        # st.session_state.core_value = ""
         st.session_state.last_site_category = new_category
 
-
-def _find_item(payload, qid: str):
-    for it in payload.get("items", []):
-        if str(it.get("id")) == str(qid):
-            return it
-    return None
-
-
-def _dedupe_labels_preserve_order(labels):
-    seen = set()
-    out = []
-    for x in labels:
-        t = (x or "").strip()
-        if not t:
-            continue
-        n = re.sub(r"\s+", " ", t.lower())
-        if n in seen:
-            continue
-        seen.add(n)
-        out.append(t)
-    return out
-
-
-def _get_candidates_block(it: dict) -> dict:
-    """
-    Backward-compatible reader for ai_actions["option_candidates"].
-
-    Supports BOTH:
-      A) list[str]                           (legacy)
-      B) {"generated": [...], "selected": [...], "max_select": 8} (new)
-
-    Returns:
-      {"generated": List[str], "selected": List[str], "max_select": int}
-    """
-    ai = it.get("ai_actions") or {}
-    raw = ai.get("option_candidates")
-
-    # Default
-    generated: List[str] = []
-    selected: List[str] = []
-    max_select = 8
-
-    # Case A: legacy list[str]
-    if isinstance(raw, list):
-        generated = [str(x).strip() for x in raw if x and str(x).strip()]
-        # default selection = first N
-        # do NOT auto-select by default
-        return {"generated": generated, "selected": [], "max_select": max_select}
-
-
-    # Case B: new dict
-    if isinstance(raw, dict):
-        generated = raw.get("generated") or []
-        selected = raw.get("selected") or []
-        max_select = int(raw.get("max_select") or 8)
-
-        # normalize
-        generated = [str(x).strip() for x in generated if x and str(x).strip()]
-        selected = [str(x).strip() for x in selected if x and str(x).strip()]
-
-
-        return {"generated": generated, "selected": selected, "max_select": max_select}
-
-    # None/unknown
-    return {"generated": [], "selected": [], "max_select": max_select}
-
-
-
-def _set_candidates_block(it: dict, *, generated: list, selected: list = None, max_select: int = 8) -> None:
-    it.setdefault("ai_actions", {})
-    it["ai_actions"]["option_candidates"] = {
-        "generated": [x for x in (generated or []) if x and str(x).strip()],
-        "selected": [x for x in (selected or []) if x and str(x).strip()] if selected is not None else [],
-        "max_select": int(max_select),
-    }
-
-def _as_label_list(x) -> list:
-    """
-    Normalize candidate/applied selections into List[str] labels.
-    Accepts:
-      - list[str]
-      - list[dict] with 'label'
-      - dict with 'selected' or 'generated'
-      - single str
-    """
-    if x is None:
-        return []
-    if isinstance(x, str):
-        return [x.strip()] if x.strip() else []
-    if isinstance(x, dict):
-        # prefer selected if present
-        if isinstance(x.get("selected"), list):
-            return [str(i).strip() for i in x["selected"] if i and str(i).strip()]
-        if isinstance(x.get("generated"), list):
-            return [str(i).strip() for i in x["generated"] if i and str(i).strip()]
-        return []
-    if isinstance(x, list):
-        out = []
-        for i in x:
-            if isinstance(i, str):
-                t = i.strip()
-                if t:
-                    out.append(t)
-            elif isinstance(i, dict) and i.get("label"):
-                t = str(i["label"]).strip()
-                if t:
-                    out.append(t)
-        return out
-    return []
-
-
-
-def _set_options_from_labels(it, labels):
-    slot = it.get("slot", "")
-    labels = _dedupe_labels_preserve_order(labels)
-    used = set()
-    out = []
-    for lab in labels:
-        base = canonical_option_key(slot, lab)
-        k = base
-        i = 2
-        while k in used:
-            k = f"{base}_{i}"
-            i += 1
-        used.add(k)
-        out.append({"key": k, "label": lab})
-    it["answer_options"] = out
-
-
-def render_reorder_ui(payload: dict, *, selected_qid: str) -> None:
-    it = _find_item(payload, selected_qid)
-    if not it:
-        st.error("Reorder: question not found.")
-        return
-
-    labels = [
-        o.get("label")
-        for o in (it.get("answer_options") or [])
-        if isinstance(o, dict) and (o.get("label") or "").strip()
-    ]
-    labels = _dedupe_labels_preserve_order(labels)
-
-    if len(labels) < 2:
-        st.info("Reorder: not enough options to reorder.")
-        return
-
-    st.markdown("### Reorder options")
-
-    # Keep a working list in session_state so buttons update instantly
-    state_key = f"reorder_working_{selected_qid}"
-    if state_key not in st.session_state:
-        st.session_state[state_key] = labels
-
-    working = st.session_state[state_key]
-
-    # Render rows
-    for i, lab in enumerate(working):
-        c1, c2, c3, c4 = st.columns([6, 1, 1, 2])
-        with c1:
-            st.write(lab)
-        with c2:
-            up = st.button("⬆️", key=f"up_{selected_qid}_{i}", disabled=(i == 0))
-        with c3:
-            down = st.button("⬇️", key=f"down_{selected_qid}_{i}", disabled=(i == len(working) - 1))
-        with c4:
-            pass
-
-        if up:
-            working[i - 1], working[i] = working[i], working[i - 1]
-            st.session_state[state_key] = working
-            st.rerun()
-
-        if down:
-            working[i + 1], working[i] = working[i], working[i + 1]
-            st.session_state[state_key] = working
-            st.rerun()
-
-    colA, colB, colC = st.columns([1, 1, 2])
-    with colA:
-        if st.button("✅ Save order", key=f"save_reorder_{selected_qid}"):
-            new_payload = copy.deepcopy(st.session_state.payload)
-            it2 = _find_item(new_payload, selected_qid)
-            _set_options_from_labels(it2, st.session_state[state_key])
-
-            it2.setdefault("ai_actions", {})
-            it2["ai_actions"]["reordered_by_user"] = True
-
-            st.session_state.payload = new_payload
-            st.session_state.logs.append(f"✅ Reordered options in Q{selected_qid}.")
-            st.rerun()
-
-    with colB:
-        if st.button("↩️ Reset", key=f"reset_reorder_{selected_qid}"):
-            st.session_state[state_key] = labels
-            st.rerun()
-
-    with colC:
-        st.caption("Use ⬆️ / ⬇️ to reorder. Click **Save order** to apply.")
-
-
-
-
-
-def suggest_options_for_item(
-    client: Any,
-    *,
-    ctx: Any,              # BuilderContext
-    it: Dict[str, Any],    # item dict from payload
-    instruction: str = "",
-    n: int = 12,
-) -> List[str]:
-    """
-    Generate a candidate pool of answer option labels using the existing rewrite_answer_options_openai
-    but in a 'suggest' mode: we don't apply automatically; we just return candidates for the user to pick.
-
-    Returns: list[str] labels (deduped).
-    """
-    qtext = (it.get("question_text") or "").strip()
-    if not qtext:
-        return []
-
-    orig_opts = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-    # If there's no baseline options, give the model a lightweight seed so it doesn't return junk.
-    seed = orig_opts if orig_opts else ["Option A", "Option B", "Other"]
-
-    base_instruction = (
-        "Propose a candidate pool of answer options (do NOT rewrite the question). "
-        "Return short option labels only. "
-        "Make them mutually exclusive where possible. "
-        "Avoid pharma/healthcare wording unless the site category is Pharma. "
-        "Include 'Other' only if useful."
-    )
-    if instruction.strip():
-        base_instruction += " " + instruction.strip()
-
-    # Use your existing function; it returns a list[str]
-    cands = rewrite_answer_options_openai(
-        client,
-        site_purpose=ctx.site_purpose,
-        survey_goal=ctx.survey_goal,
-        site_category=ctx.site_category,
-        question_text=qtext,
-        original_options=seed,
-        instruction=base_instruction,
-        keep_other_if_present=True,
-    )
-
-    # Dedupe + cap
-    cands = _dedupe_labels_preserve_order(cands)[: max(8, min(16, n))]
-    return cands
-
-
-
-def _split_pipe(cmd: str, expected_parts: int):
-    parts = [p.strip() for p in cmd.split("|")]
-    if len(parts) < expected_parts:
-        return None
-    head = parts[0]
-    tail = parts[1:]
-    while len(tail) > expected_parts - 1:
-        tail[-2] = tail[-2] + " | " + tail[-1]
-        tail.pop()
-    return [head] + tail
-
-
-def _bullet_join(xs: List[str]) -> str:
-    xs = [x.strip() for x in (xs or []) if x and x.strip()]
-    if not xs:
-        return ""
-    if len(xs) == 1:
-        return xs[0]
-    if len(xs) == 2:
-        return f"{xs[0]} and {xs[1]}"
-    return ", ".join(xs[:-1]) + f", and {xs[-1]}"
-
-
-def compose_site_purpose(
-    *,
-    site_name: str,
-    site_type: str,
-    primary_audience: List[str],
-    domain_topic: str,
-    core_value: str,
-    primary_actions: List[str],
-    extra_context: str,
-) -> str:
-    aud = _bullet_join(primary_audience) or "visitors"
-    domain = domain_topic.strip()
-    value = core_value.strip()
-    actions = _bullet_join(primary_actions)
-
-    parts = []
-    if site_name.strip():
-        parts.append(f"{site_name.strip()} is a {site_type.strip().lower()} site")
-    else:
-        parts.append(f"A {site_type.strip().lower()} site")
-
-    parts.append(f"for {aud.lower()}")
-
-    if domain:
-        parts.append(f"focused on {domain}")
-
-    if value:
-        parts.append(f"that helps users {value}")
-    elif actions:
-        parts.append(f"that helps users {actions.lower()}")
-
-    s = " ".join(parts).strip()
-    if not s.endswith("."):
-        s += "."
-    if extra_context.strip():
-        ec = extra_context.strip()
-        if not ec.endswith("."):
-            ec += "."
-        s += f" {ec}"
-    return s
-
-
-def compose_survey_goal(
-    *,
-    goal_type: str,
-    goal_details: str,
-    identify_roles: bool,
-    capture_intent: bool,
-    measure_satisfaction: bool,
-    find_blockers: bool,
-    gauge_readiness: bool,
-    desired_next_steps: List[str],
-    dont_ask: List[str],
-    max_questions_hint: str,
-) -> str:
-    objectives = []
-
-    primary = goal_type.strip()
-    if primary:
-        objectives.append(primary)
-
-    if identify_roles:
-        objectives.append("understand who’s visiting")
-    if capture_intent:
-        objectives.append("understand what they’re trying to do / find")
-    if measure_satisfaction:
-        objectives.append("measure satisfaction")
-    if find_blockers:
-        objectives.append("identify blockers or confusion")
-    if gauge_readiness:
-        objectives.append("understand readiness / next step")
-
-    steps = _bullet_join(desired_next_steps)
-    if steps:
-        objectives.append(f"and how close they are to {steps.lower()}")
-
-    detail = goal_details.strip()
-    if detail:
-        objectives.append(f"Context: {detail}")
-
-    neg_map = {
-        "journey_stage": "Don't ask journey stage.",
-        "prior_knowledge": "Don't ask familiarity/prior knowledge.",
-        "trigger": "Don't ask trigger.",
-    }
-    neg_lines = [neg_map[k] for k in dont_ask if k in neg_map]
-
-    mq = max_questions_hint.strip()
-    if mq:
-        objectives.append(mq)
-
-    base = "Survey goal: " + "; ".join([o for o in objectives if o])
-    if not base.endswith("."):
-        base += "."
-    if neg_lines:
-        base += " " + " ".join(neg_lines)
-    return base
-
-
-# -----------------------
-# Command console
-# -----------------------
+# ------------------------------------------------------------
+# Command console (apply_command)
+# ------------------------------------------------------------
 def apply_command(payload, ctx, client, cmd: str):
     cmd = (cmd or "").strip()
     if not cmd:
@@ -612,9 +710,6 @@ def apply_command(payload, ctx, client, cmd: str):
 
     low = cmd.lower().strip()
 
-    # -----------------------
-    # helpers
-    # -----------------------
     def _renumber_items(pl):
         for i, it in enumerate(pl.get("items", []), start=1):
             it["id"] = str(i)
@@ -645,21 +740,11 @@ def apply_command(payload, ctx, client, cmd: str):
             _set_options_from_labels(item, option_labels[:10])
         return item
 
-    def _ensure_has_options(it: dict) -> bool:
-        opts = it.get("answer_options") or []
-        return any(isinstance(o, dict) and (o.get("label") or "").strip() for o in opts)
-
-    # -----------------------
     # legacy alias
-    # -----------------------
     if low.startswith("genl2 "):
         cmd = "l2 " + cmd.split(" ", 1)[1]
         low = cmd.lower()
-    
 
-    # =========================================================
-    # RULE-BASED: add/delete/edit questions/options
-    # =========================================================
     if low.startswith("addq "):
         parts = _split_pipe(cmd, 3)
         if not parts:
@@ -668,7 +753,7 @@ def apply_command(payload, ctx, client, cmd: str):
                 "  addq after <qid> | <question_text> | <opt1; opt2; ...>\n"
                 "  addq end | <question_text> | <opt1; opt2; ...>"
             )
-        head = parts[0].strip()  # "addq after 2" or "addq end"
+        head = parts[0].strip()
         qtext = parts[1].strip()
         opt_labels = _parse_semicolon_list(parts[2].strip())
 
@@ -738,306 +823,6 @@ def apply_command(payload, ctx, client, cmd: str):
         it2["ai_actions"]["edited_by_user"] = True
         return new_payload, f"✅ Updated question text for Q{qid}."
 
-    # if low.startswith("addopt "):
-    #     parts = _split_pipe(cmd, 2)
-    #     if not parts:
-    #         return payload, "Usage: addopt <qid> | <label>"
-    #     head, label = parts[0], parts[1].strip()
-    #     hp = head.split()
-    #     if len(hp) != 2:
-    #         return payload, "Usage: addopt <qid> | <label>"
-    #     qid = hp[1].strip()
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-    #     if not _ensure_has_options(it):
-    #         return payload, "This question has no answer options (maybe OpenText)."
-
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-    #     labels = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-    #     labels.append(label)
-    #     _set_options_from_labels(it2, labels)
-    #     return new_payload, f"✅ Added option to Q{qid}."
-
-    # if low.startswith("delopt "):
-    #     parts = cmd.split()
-    #     if len(parts) != 3:
-    #         return payload, "Usage: delopt <qid> <idx> (1-based)"
-    #     qid = parts[1].strip()
-    #     try:
-    #         idx = int(parts[2]) - 1
-    #     except Exception:
-    #         return payload, "idx must be an integer."
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-    #     labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-    #     if not labels:
-    #         return payload, "No answer options."
-    #     if not (0 <= idx < len(labels)):
-    #         return payload, f"Index out of range (1..{len(labels)})"
-    #     if len(labels) <= 2:
-    #         return payload, "Refusing to delete: would leave fewer than 2 options."
-
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-    #     labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-    #     removed = labels2.pop(idx)
-    #     _set_options_from_labels(it2, labels2)
-    #     return new_payload, f"🗑️ Deleted option '{removed}' from Q{qid}."
-
-    # if low.startswith("editopt "):
-    #     parts = _split_pipe(cmd, 2)
-    #     if not parts:
-    #         return payload, "Usage: editopt <qid> <idx> | <new label>"
-    #     head, new_label = parts[0], parts[1].strip()
-    #     hp = head.split()
-    #     if len(hp) != 3:
-    #         return payload, "Usage: editopt <qid> <idx> | <new label>"
-    #     qid = hp[1].strip()
-    #     try:
-    #         idx = int(hp[2]) - 1
-    #     except Exception:
-    #         return payload, "idx must be an integer."
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-    #     labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-    #     if not (0 <= idx < len(labels)):
-    #         return payload, f"Index out of range (1..{len(labels)})"
-
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-    #     labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-    #     labels2[idx] = new_label
-    #     _set_options_from_labels(it2, labels2)
-    #     return new_payload, f"✅ Updated option {idx+1} for Q{qid}."
-
-    # =========================================================
-    # AI: suggest candidates (store), show, apply selected, clear
-    # =========================================================
-    # if low.startswith("suggestopts "):
-    #     parts = _split_pipe(cmd, 2)
-    #     if not parts:
-    #         return payload, "Usage: suggestopts <qid> | <instruction>"
-    #     head, instruction = parts[0], parts[1]
-    #     hp = head.split()
-    #     if len(hp) < 2:
-    #         return payload, "Usage: suggestopts <qid> | <instruction>"
-    #     qid = hp[1].strip()
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-    #     if client is None:
-    #         return payload, "OpenAI client unavailable (enable key + LLM)."
-
-    #     orig_opts = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-    #     if not orig_opts:
-    #         return payload, "No answer options to extend for this question."
-
-    #     instruction2 = (
-    #         "Generate additional answer options that fit the question. "
-    #         "Do NOT remove or rewrite the existing options. "
-    #         "Return a list that includes the original options plus new ones. "
-    #         "Keep them short, mutually exclusive, and practical. "
-    #         f"User instruction: {instruction}"
-    #     )
-
-    #     expanded = rewrite_answer_options_openai(
-    #         client,
-    #         site_purpose=ctx.site_purpose,
-    #         survey_goal=ctx.survey_goal,
-    #         site_category=ctx.site_category,
-    #         question_text=it.get("question_text", ""),
-    #         original_options=orig_opts,
-    #         instruction=instruction2,
-    #         keep_other_if_present=True,
-    #     )
-    #     expanded = _dedupe_labels_preserve_order(expanded)
-
-    #     # Only keep *new* candidates
-    #     existing_norm = {x.strip().lower() for x in orig_opts}
-    #     cands = []
-    #     for x in expanded:
-    #         t = (x or "").strip()
-    #         if not t:
-    #             continue
-    #         if t.lower() in existing_norm:
-    #             continue
-    #         if t.lower() in {c.lower() for c in cands}:
-    #             continue
-    #         cands.append(t)
-
-    #     if not cands:
-    #         return payload, "No new candidates generated (try a different instruction)."
-
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-    #     it2.setdefault("ai_actions", {})
-    #     _set_candidates_block(it2, generated=cands[:20], selected=[], max_select=8)
-    #     it2["ai_actions"]["option_candidates_instruction"] = instruction.strip()
-
-    #     return new_payload, f"✅ Saved {min(len(cands),20)} candidate options for Q{qid}. Use: showcands {qid} then applycands {qid} 1,2,..."
-
-    # if low.startswith("showcands "):
-    #     parts = cmd.split()
-    #     if len(parts) != 2:
-    #         return payload, "Usage: showcands <qid>"
-    #     qid = parts[1].strip()
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-
-    #     c = _get_candidates_block(it)
-    #     cands = c["generated"] or []
-    #     if not cands:
-    #         return payload, f"No candidates stored for Q{qid}. Run: suggestopts {qid} | <instruction>"
-
-    #     out = [f"Candidates for Q{qid} (max_select={c['max_select']}):"]
-    #     for i, lab in enumerate(cands, start=1):
-    #         out.append(f" {i}. {lab}")
-    #     return payload, "\n".join(out)
-
-
-    # if low.startswith("applycands "):
-    #     parts = cmd.split(" ", 2)
-    #     if len(parts) != 3:
-    #         return payload, "Usage: applycands <qid> <idx1,idx2,...> (1-based from candidates list)"
-    #     qid = parts[1].strip()
-    #     idxs_raw = parts[2].strip()
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-
-    #     # option_candidates may be:
-    #     #   - list[str]  (your current format)
-    #     #   - dict {"generated":[...], "selected":[...], "max_select":8} (older/newer UI format)
-    #     oc = (it.get("ai_actions") or {}).get("option_candidates") or []
-    #     if isinstance(oc, dict):
-    #         cands = oc.get("generated") or []
-    #     else:
-    #         cands = oc
-
-    #     if not isinstance(cands, list) or not cands:
-    #         return payload, f"No candidates found for Q{qid}. Run: suggestopts {qid} | <instruction>"
-
-    #     try:
-    #         idxs = [int(x.strip()) - 1 for x in idxs_raw.split(",") if x.strip()]
-    #     except Exception:
-    #         return payload, "Bad index list."
-
-    #     if not idxs:
-    #         return payload, "No indices provided."
-    #     if any(i < 0 or i >= len(cands) for i in idxs):
-    #         return payload, f"Index out of range (1..{len(cands)})"
-
-    #     # Selected candidate labels
-    #     chosen = [str(cands[i]).strip() for i in idxs if str(cands[i]).strip()]
-    #     chosen = _dedupe_labels_preserve_order(chosen)
-    #     if len(chosen) < 1:
-    #         return payload, "No valid candidates selected."
-
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-
-    #     # Merge into existing options (do NOT wipe the originals)
-    #     existing = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-    #     merged = _dedupe_labels_preserve_order(existing + chosen)
-
-    #     # Keep a reasonable cap (optional)
-    #     merged = merged[:10]  # adjust cap if you want
-
-    #     _set_options_from_labels(it2, merged)
-
-    #     it2.setdefault("ai_actions", {})
-    #     it2["ai_actions"]["applied_from_candidates"] = {
-    #         "added": chosen,
-    #         "result": merged,
-    #     }
-
-    #     # If option_candidates is a dict-format block, also persist "selected" for UI
-    #     if isinstance(oc, dict):
-    #         it2["ai_actions"]["option_candidates"]["selected"] = chosen
-
-    #     return new_payload, f"✅ Added {len(chosen)} candidate option(s) to Q{qid} (now {len(merged)} total)."
-
-
-    # if low.startswith("clearcands "):
-    #     parts = cmd.split()
-    #     if len(parts) != 2:
-    #         return payload, "Usage: clearcands <qid>"
-    #     qid = parts[1].strip()
-
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, f"No question found with id={qid}"
-
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-    #     it2.setdefault("ai_actions", {})
-    #     it2["ai_actions"].pop("option_candidates", None)
-    #     it2["ai_actions"].pop("option_candidates_instruction", None)
-    #     it2["ai_actions"].pop("applied_from_candidates", None)
-    #     return new_payload, f"✅ Cleared candidate options for Q{qid}."
-
-    # -----------------------
-    # reorder/move (existing)
-    # -----------------------
-    # if low.startswith("moveopt "):
-    #     parts = cmd.split()
-    #     if len(parts) != 4:
-    #         return payload, "Usage: moveopt <qid> <from_idx> <to_idx> (1-based)"
-    #     it = _find_item(payload, parts[1])
-    #     if not it:
-    #         return payload, "No question found."
-    #     labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-    #     try:
-    #         a = int(parts[2]) - 1
-    #         b = int(parts[3]) - 1
-    #     except Exception:
-    #         return payload, "Indices must be integers."
-    #     if not (0 <= a < len(labels) and 0 <= b < len(labels)):
-    #         return payload, f"Index out of range (1..{len(labels)})"
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, parts[1])
-    #     labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-    #     x = labels2.pop(a)
-    #     labels2.insert(b, x)
-    #     _set_options_from_labels(it2, labels2)
-    #     return new_payload, f"✅ Moved option {parts[2]} → {parts[3]} for Q{parts[1]}."
-
-    # if low.startswith("reorderopts "):
-    #     parts = cmd.split(" ", 2)
-    #     if len(parts) != 3:
-    #         return payload, "Usage: reorderopts <qid> <idx1,idx2,...> (1-based)"
-    #     qid = parts[1].strip()
-    #     it = _find_item(payload, qid)
-    #     if not it:
-    #         return payload, "No question found."
-    #     labels = [o.get("label") for o in (it.get("answer_options") or []) if isinstance(o, dict)]
-    #     try:
-    #         order = [int(x.strip()) - 1 for x in parts[2].split(",")]
-    #     except Exception:
-    #         return payload, "Bad index list."
-    #     if sorted(order) != list(range(len(labels))):
-    #         return payload, f"Must include each index exactly once (1..{len(labels)})"
-    #     new_payload = copy.deepcopy(payload)
-    #     it2 = _find_item(new_payload, qid)
-    #     labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
-    #     new_labels = [labels2[i] for i in order]
-    #     _set_options_from_labels(it2, new_labels)
-    #     return new_payload, f"✅ Reordered options for Q{qid}."
-
-    # -----------------------
-    # LLM rewrite (existing)
-    # -----------------------
     if low.startswith("tuneq "):
         parts = _split_pipe(cmd, 2)
         if not parts:
@@ -1096,11 +881,9 @@ def apply_command(payload, ctx, client, cmd: str):
 
     return payload, "Unknown command."
 
-
-
-# -----------------------
+# ------------------------------------------------------------
 # Sidebar: Config
-# -----------------------
+# ------------------------------------------------------------
 st.sidebar.header("Config")
 st.sidebar.markdown(
     "- Fill the structured **Build** form\n"
@@ -1111,7 +894,7 @@ st.sidebar.markdown(
 
 lib_path = st.sidebar.text_input(
     "Library path (xlsx)",
-    value=os.getenv("LIB_PATH", "Question_Rates_Merged_backbone_ready.xlsx"),
+    value=os.getenv("LIB_PATH", LIB_PATH),
 )
 out_name = st.sidebar.text_input("Output filename", value="draft_survey_arrival_v10.json")
 
@@ -1147,24 +930,19 @@ if key_mode == "Paste in UI":
     if ui_key:
         os.environ["OPENAI_API_KEY"] = ui_key
 
-@st.cache_data(show_spinner=False)
-def cached_load_library(path: str):
-    return load_library(path)
-
 # Tabs
 tab_build, tab_preview, tab_console, tab_advanced = st.tabs(
     ["Build", "Survey Preview", "Command Console", "Advanced"]
 )
 
-# -----------------------
+# ------------------------------------------------------------
 # BUILD TAB
-# -----------------------
+# ------------------------------------------------------------
 with tab_build:
     st.subheader("Website basics")
 
     c1, c2, c3 = st.columns([1.1, 1, 1])
     with c1:
-        # placeholder depends on site_category, so set it later after category selection
         site_name = st.text_input("Site name (optional)", placeholder="e.g., Paragon Stairs", key="site_name")
 
     with c2:
@@ -1175,9 +953,7 @@ with tab_build:
             key="site_category",
         )
 
-    # Hard reset dependent widgets when category changes (makes UI feel truly dynamic)
     hard_reset_on_category_change(site_category)
-
     ui = get_ui_options(site_category)
 
     with c3:
@@ -1195,7 +971,6 @@ with tab_build:
             key="site_type",
         )
 
-    # Ensure selections stay valid when category changes
     reset_multiselect_if_invalid("primary_audience", ui["primary_audience"])
     reset_multiselect_if_invalid("primary_actions", ui["primary_actions"])
 
@@ -1358,15 +1133,14 @@ with tab_build:
 
         st.success("Built! Go to **Survey Preview** or **Command Console**.")
 
-# -----------------------
+# ------------------------------------------------------------
 # PREVIEW TAB
-# -----------------------
+# ------------------------------------------------------------
 with tab_preview:
     st.subheader("Neat preview")
     if st.session_state.payload is None:
         st.info("Build a survey in the **Build** tab first.")
     else:
-        # 1) Existing neat preview
         st.code(neat_preview(st.session_state.payload, show_keys=False), language="text")
 
         blob = json.dumps(st.session_state.payload, ensure_ascii=False, indent=2).encode("utf-8")
@@ -1377,7 +1151,6 @@ with tab_preview:
             mime="application/json",
         )
 
-        # 2) NEW: Option Review (Suggest → Select → Apply)
         st.divider()
         st.subheader("Option Review (Suggest → Select → Apply)")
 
@@ -1396,10 +1169,7 @@ with tab_preview:
             construct = it.get("construct", "")
 
             with st.expander(f"Q{qid} • {construct} • {slot}", expanded=False):
-                if qtext:
-                    st.markdown(qtext)
-                else:
-                    st.markdown("_(no question text)_")
+                st.markdown(qtext if qtext else "_(no question text)_")
 
                 selected = st.multiselect(
                     "Select the answer options to keep",
@@ -1408,7 +1178,6 @@ with tab_preview:
                     key=f"cand_select_{qid}",
                 )
 
-                # soft max cap
                 if len(selected) > c["max_select"]:
                     st.warning(f"Please select at most {c['max_select']} options.")
                     selected = selected[: c["max_select"]]
@@ -1428,10 +1197,8 @@ with tab_preview:
                         _set_options_from_labels(it2, selected)
 
                         st.session_state.payload = new_payload
-
                         st.success("Applied! The preview above reflects your updated options.")
                         st.rerun()
-
 
                 with colB:
                     if st.button("Clear candidates", key=f"clear_cands_btn_{qid}"):
@@ -1447,11 +1214,7 @@ with tab_preview:
                         preview_key = f"cand_select_{qid}"
                         if preview_key in st.session_state:
                             del st.session_state[preview_key]
-
                         st.rerun()
-
-
-
 
         if not any_found:
             st.info(
@@ -1459,14 +1222,23 @@ with tab_preview:
                 "Use **Command Console → AI option recommender → Suggest options** first."
             )
 
-
-# -----------------------
+# ------------------------------------------------------------
 # COMMAND CONSOLE TAB
-# -----------------------
+# ------------------------------------------------------------
 with tab_console:
     st.subheader("Command Console")
 
-    # --- Command catalog (UI only) ---
+    # --- Persisted success message from actions that call st.rerun() ---
+    msg = st.session_state.get("last_action_msg")
+    if msg:
+        st.success(msg)
+        # Toast is harder to miss if you're scrolled down
+        try:
+            st.toast(msg)
+        except Exception:
+            pass
+        del st.session_state["last_action_msg"]
+
     RULE_BASED = [
         ("editq <qid> | <new question text>", "Edit question text"),
         ("addq after <qid> | <question_text> | <opt1; opt2; ...>", "Insert a new manual question after Q<qid>"),
@@ -1484,9 +1256,7 @@ with tab_console:
     else:
         payload = st.session_state.payload
 
-        # ==========================================================
-        # 1) Command input (TOP) + reference right above it
-        # ==========================================================
+        # 1) Command input
         st.markdown("## Command input (power-user)")
         st.caption("Run typed commands. Reference is right here so you don’t have to scroll.")
 
@@ -1519,7 +1289,7 @@ with tab_console:
                 if not cmd.strip():
                     st.warning("Please enter a command.")
                 else:
-                    new_payload, msg = apply_command(
+                    new_payload, msg2 = apply_command(
                         st.session_state.payload,
                         st.session_state.ctx,
                         st.session_state.client,
@@ -1527,13 +1297,12 @@ with tab_console:
                     )
                     st.session_state.payload = new_payload
                     st.session_state.history.append(cmd)
-                    st.session_state.logs.append(msg)
+                    st.session_state.logs.append(msg2)
 
-                    # ✅ Don’t dump full survey output here; just status
-                    if msg.lower().startswith("unknown command"):
-                        st.error(msg)
+                    if msg2.lower().startswith("unknown command"):
+                        st.error(msg2)
                     else:
-                        st.success(msg)
+                        st.success(msg2)
 
         with hist_col:
             st.markdown("**History**")
@@ -1545,16 +1314,19 @@ with tab_console:
             st.code("\n\n".join(st.session_state.logs[-10:]), language="text")
 
         st.divider()
+        st.markdown("## Live preview (after changes)")
+        if st.session_state.payload is not None:
+            with st.expander("Show neat preview", expanded=True):
+                st.code(neat_preview(st.session_state.payload, show_keys=False), language="text")
 
-        # ==========================================================
-        # 2) AI option recommender (interactive) (BELOW)
-        # ==========================================================
+        st.divider()
+
+        # 2) AI option recommender
         st.markdown("## AI option recommender (interactive)")
         st.caption("Suggest candidate answer options with AI, then append selected ones. You can also delete current options inline.")
 
         items = payload.get("items", []) or []
 
-        # Build question choices for dropdown
         q_choices = []
         for it in items:
             qid = str(it.get("id", "")).strip()
@@ -1596,7 +1368,7 @@ with tab_console:
                         c_text, c_edit, c_save, c_del = st.columns([5, 3, 1, 1])
                         with c_text:
                             st.write(lab)
-                        
+
                         with c_edit:
                             new_lab = st.text_input(
                                 "Rename",
@@ -1613,14 +1385,14 @@ with tab_console:
                                 labels2 = [o.get("label") for o in (it2.get("answer_options") or []) if isinstance(o, dict)]
                                 labels2 = _dedupe_labels_preserve_order(labels2)
 
-                                # replace only the i-th option label (by position in cur_opts)
                                 labels2[i] = new_lab.strip() if new_lab.strip() else labels2[i]
                                 _set_options_from_labels(it2, labels2)
 
                                 st.session_state.payload = new_payload
                                 st.session_state.logs.append(f"✅ Renamed option {i+1} in Q{selected_qid}.")
                                 st.rerun()
-                        with c_del:  # ✅ was c_btn
+
+                        with c_del:
                             if st.button("🗑️", key=row_key, help="Delete this option"):
                                 new_payload = copy.deepcopy(payload)
                                 it2 = _find_item(new_payload, selected_qid)
@@ -1647,9 +1419,8 @@ with tab_console:
                                     st.session_state.logs.append(f"🗑️ Deleted option '{lab}' from Q{selected_qid}.")
                                     payload = new_payload
                                     st.rerun()
-                
-                # ✅ NEW: Reorder options UI (no commands)
-                render_reorder_ui(payload, selected_qid=selected_qid)       
+
+                render_reorder_ui(payload, selected_qid=selected_qid)
 
                 st.divider()
                 st.markdown("### Add options")
@@ -1706,7 +1477,7 @@ with tab_console:
                         new_payload = copy.deepcopy(payload)
                         it2 = _find_item(new_payload, selected_qid)
 
-                        cands = suggest_options_for_item(
+                        cands2 = suggest_options_for_item(
                             st.session_state.client,
                             ctx=st.session_state.ctx,
                             it=it2,
@@ -1714,10 +1485,10 @@ with tab_console:
                             n=12,
                         )
 
-                        if not cands:
+                        if not cands2:
                             st.warning("No candidates generated. Try a different instruction.")
                         else:
-                            _set_candidates_block(it2, generated=cands[:20], selected=[], max_select=8)
+                            _set_candidates_block(it2, generated=cands2[:20], selected=[], max_select=8)
                             it2.setdefault("ai_actions", {})
                             it2["ai_actions"]["option_candidates_instruction"] = suggest_instruction.strip()
                             st.session_state.payload = new_payload
@@ -1789,67 +1560,234 @@ with tab_console:
                         it2["ai_actions"].pop("applied_from_candidates", None)
 
                         st.session_state.payload = new_payload
-
                         if cand_key in st.session_state:
                             del st.session_state[cand_key]
-
                         st.rerun()
                 else:
                     st.info("No candidates stored yet. Click **Suggest options** to generate candidates.")
 
-
-
-
+        # ✅ L2 follow-ups block (properly OUTSIDE the selected_qid flow)
         st.divider()
+        st.markdown("## L2 follow-ups (user-driven)")
 
-        # ==========================================================
-        # B) Power-user command input (text)
-        # ==========================================================
-        # st.markdown("## Command input (power-user)")
-        # st.caption("Use this if you prefer typed commands or want advanced operations (insert/delete, etc.).")
+        payload = st.session_state.payload
+        items = payload.get("items", []) or []
 
-        # c1, c2 = st.columns([2, 1])
+        # 1) choose parent
+        parent_choices = []
+        for it in items:
+            if str(it.get("level", "")).upper() != "L1":
+                continue
+            opts = it.get("answer_options") or []
+            if not any(isinstance(o, dict) and (o.get("key") or "").strip() for o in opts):
+                continue
+            qid = str(it.get("id", "")).strip()
+            qtext = (it.get("question_text") or "").strip()
+            parent_choices.append((qid, f"Q{qid}: {qtext[:90]}{'…' if len(qtext) > 90 else ''}"))
 
-        # with c1:
-        #     cmd = st.text_input(
-        #         "Command",
-        #         placeholder=(
-        #             "Examples:\n"
-        #             "  addq after 2 | What matters most? | Price; Style; Install time; Other\n"
-        #             "  delq 4\n"
-        #             "  tuneq 1 | Make it shorter"
-        #         ),
-        #         key="cmd_console_power",
-        #     )
-        #     run = st.button("Run command", key="run_cmd_console_power")
-        #     if run and cmd.strip():
-        #         new_payload, msg = apply_command(
-        #             st.session_state.payload,
-        #             st.session_state.ctx,
-        #             st.session_state.client,
-        #             cmd,
-        #         )
-        #         st.session_state.payload = new_payload
-        #         st.session_state.history.append(cmd)
-        #         st.session_state.logs.append(msg)
+        if not parent_choices:
+            st.info("No eligible L1 questions with keyed answer options found.")
+        else:
+            parent_qid = st.selectbox(
+                "Parent question (L1)",
+                options=[qid for qid, _ in parent_choices],
+                format_func=lambda qid: dict(parent_choices).get(qid, qid),
+                key="l2_parent_qid_user",
+            )
 
-        #     if st.session_state.logs:
-        #         st.code("\n\n".join(st.session_state.logs[-10:]), language="text")
+            # Clear any stale drafts from other parents
+            draft_state_key = f"l2_draft_{parent_qid}"
+            for k in list(st.session_state.keys()):
+                if k.startswith("l2_draft_") and k != draft_state_key:
+                    del st.session_state[k]
 
-        # with c2:
-        #     st.markdown("**History**")
-        #     for h in reversed(st.session_state.history[-25:]):
-        #         st.code(h, language="text")
+            parent_it = _find_item(payload, parent_qid)
+            if not parent_it:
+                st.error("Parent question not found.")
+            else:
+                st.markdown("### Step 1 — Choose trigger answer option(s)")
 
-        # st.markdown("**Updated preview**")
-        # st.code(neat_preview(st.session_state.payload, show_keys=False), language="text")
+                parent_opts = [
+                    o for o in (parent_it.get("answer_options") or [])
+                    if isinstance(o, dict) and (o.get("key") or "").strip()
+                ]
 
+                # Display "Label (key)" to avoid the duplicated "answer: answer" look and avoid collisions on duplicate labels.
+                display_opts = [f"{(o.get('label') or '').strip()}  ({o.get('key')})" for o in parent_opts]
+                display_to_key = {f"{(o.get('label') or '').strip()}  ({o.get('key')})": o.get("key") for o in parent_opts}
 
+                selected_display = st.multiselect(
+                    "Show L2 only when the user selects these parent answers",
+                    options=display_opts,
+                    default=[],
+                    key="l2_trigger_display_user",
+                )
+                trigger_keys = [display_to_key[x] for x in selected_display if x in display_to_key and display_to_key[x]]
 
+                st.markdown("### Step 2 — Requirements (what should this L2 accomplish?)")
+                requirements = st.text_area(
+                    "Requirements sent to AI",
+                    placeholder="e.g., If they chose 'Contractor', ask trade type; keep it short; 4 options max.",
+                    height=100,
+                    key="l2_requirements_user",
+                )
 
-# -----------------------
+                st.markdown("### Step 3 — L2 question type")
+                desired_qtype_ui = st.selectbox(
+                    "Desired L2 question type",
+                    ["SingleSelection", "MultiSelection", "OpenText"],
+                    index=0,
+                    key="l2_desired_qtype_user",
+                )
+                desired_qtype = normalize_qtype(desired_qtype_ui)
+
+                colA, colB = st.columns([1, 2])
+                with colA:
+                    gen_btn = st.button("Generate L2 draft", key="btn_generate_l2_user")
+                with colB:
+                    st.caption("Generates one L2 draft from your selected triggers + requirements.")
+
+                if gen_btn:
+                    if st.session_state.client is None:
+                        st.error("OpenAI client unavailable (enable key + LLM).")
+                    elif not trigger_keys:
+                        st.warning("Pick at least one trigger answer key.")
+                    elif not requirements.strip():
+                        st.warning("Please enter requirements for the L2.")
+                    else:
+                        draft = generate_l2_from_user_requirements(
+                            st.session_state.client,
+                            ctx=st.session_state.ctx,
+                            parent_it=parent_it,
+                            trigger_keys=trigger_keys,
+                            requirements=requirements.strip(),
+                            desired_qtype=desired_qtype,
+                        )
+                        st.session_state[draft_state_key] = draft
+                        st.success("Generated L2 draft. Review below.")
+
+                draft = st.session_state.get(draft_state_key)
+
+                if draft:
+                    st.divider()
+                    st.markdown("### Generated L2 draft (preview)")
+                    st.write(f"**Triggers:** {draft.get('trigger_answer_keys')}")
+                    st.write(f"**Type:** {draft.get('question_type')}")
+                    st.write(f"**Question:** {draft.get('question_text')}")
+                    if draft.get("question_type") != "OpenText":
+                        st.write("**Options:**")
+                        for opt in (draft.get("answer_options") or []):
+                            st.write(f"- {opt}")
+
+                    add_after, add_end = st.columns([1, 1])
+
+                    # Use a set for robust anti-double-click / anti-duplicate behavior
+                    st.session_state.setdefault("l2_added_fps", set())
+                    fp = l2_fingerprint(parent_qid, draft)
+
+                    with add_after:
+                        add_after_clicked = st.button("➕ Add after parent", key="btn_add_l2_after_user")
+                        if add_after_clicked:
+                            if fp in st.session_state["l2_added_fps"]:
+                                st.warning("This L2 was just added — ignoring duplicate click.")
+                            else:
+                                new_payload = copy.deepcopy(st.session_state.payload)
+                                items2 = new_payload.get("items", []) or []
+
+                                parent_idx = next(
+                                    (ix for ix, itx in enumerate(items2) if str(itx.get("id")) == str(parent_qid)),
+                                    None,
+                                )
+                                if parent_idx is None:
+                                    st.error("Could not locate parent in items.")
+                                else:
+                                    parent_item_live = _find_item(new_payload, parent_qid)
+                                    parent_var = var_name_for_slot(str(parent_item_live.get("slot")), str(parent_item_live.get("level")))
+                                    parent_qtype = normalize_qtype(str(parent_item_live.get("question_type") or "SingleSelection"))
+
+                                    expected_cond = build_l2_condition(
+                                        parent_var, parent_qtype, list(draft.get("trigger_answer_keys") or [])
+                                    )
+                                    expected_text = (draft.get("question_text") or "").strip()
+
+                                    def _is_identical_l2(x: dict) -> bool:
+                                        if str(x.get("level", "")).upper() != "L2":
+                                            return False
+                                        if (x.get("question_text") or "").strip() != expected_text:
+                                            return False
+                                        if x.get("display_condition_json") != expected_cond:
+                                            return False
+                                        return True
+
+                                    if any(_is_identical_l2(x) for x in items2):
+                                        st.warning("An identical L2 already exists. Not adding another.")
+                                    else:
+                                        new_item = build_l2_item_from_draft(
+                                            parent_item=parent_item_live,
+                                            draft=draft,
+                                            new_id=str(parent_idx + 2),  # placeholder
+                                        )
+                                        items2.insert(parent_idx + 1, new_item)
+
+                                        for k, itx in enumerate(items2, start=1):
+                                            itx["id"] = str(k)
+
+                                        new_payload["items"] = items2
+                                        st.session_state.payload = new_payload
+
+                                        st.session_state["l2_added_fps"].add(fp)
+                                        st.session_state["last_action_msg"] = "✅ Added L2 after parent."
+                                        st.rerun()
+
+                    with add_end:
+                        add_end_clicked = st.button("➕ Add at end", key="btn_add_l2_end_user")
+                        if add_end_clicked:
+                            if fp in st.session_state["l2_added_fps"]:
+                                st.warning("This L2 was just added — ignoring duplicate click.")
+                            else:
+                                new_payload = copy.deepcopy(st.session_state.payload)
+                                items2 = new_payload.get("items", []) or []
+
+                                parent_item_live = _find_item(new_payload, parent_qid)
+                                parent_var = var_name_for_slot(str(parent_item_live.get("slot")), str(parent_item_live.get("level")))
+                                parent_qtype = normalize_qtype(str(parent_item_live.get("question_type") or "SingleSelection"))
+
+                                expected_cond = build_l2_condition(
+                                    parent_var, parent_qtype, list(draft.get("trigger_answer_keys") or [])
+                                )
+                                expected_text = (draft.get("question_text") or "").strip()
+
+                                def _is_identical_l2(x: dict) -> bool:
+                                    if str(x.get("level", "")).upper() != "L2":
+                                        return False
+                                    if (x.get("question_text") or "").strip() != expected_text:
+                                        return False
+                                    if x.get("display_condition_json") != expected_cond:
+                                        return False
+                                    return True
+
+                                if any(_is_identical_l2(x) for x in items2):
+                                    st.warning("An identical L2 already exists. Not adding another.")
+                                else:
+                                    new_item = build_l2_item_from_draft(
+                                        parent_item=parent_item_live,
+                                        draft=draft,
+                                        new_id=str(len(items2) + 1),
+                                    )
+                                    items2.append(new_item)
+
+                                    for k, itx in enumerate(items2, start=1):
+                                        itx["id"] = str(k)
+
+                                    new_payload["items"] = items2
+                                    st.session_state.payload = new_payload
+
+                                    st.session_state["l2_added_fps"].add(fp)
+                                    st.session_state["last_action_msg"] = "✅ Added L2 at end."
+                                    st.rerun()
+# ------------------------------------------------------------
 # ADVANCED TAB
-# -----------------------
+# ------------------------------------------------------------
 with tab_advanced:
     st.subheader("Advanced (optional)")
     if st.session_state.payload is None:

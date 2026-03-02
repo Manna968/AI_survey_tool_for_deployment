@@ -1,43 +1,3 @@
-"""
-survey_builder_backbone_arrival_v10_llm_selection_openai_interactive.py
-
-v10: LLM-assisted SELECTION (ranker) + optional rewrite + optional fallback generation.
-
-Core goal:
-- Stop hardcoding `is_backbone == TRUE` as a hard filter.
-- Use OpenAI to SELECT the most appropriate library question per construct/slot (bounded: choose from shortlist).
-- Keep flow deterministic (construct plan still deterministic) unless you change policy.
-- Keep LLM "from scratch" generation rare and gated.
-
-How LLM is used (in order of preference):
-1) LLM selection (choose best candidate from shortlist) [optional]
-2) Optional bounded rewrite of the selected library template (text + options) [optional]
-3) Optional fallback generation when no candidates exist [optional]
-4) L2 followups (same as before) [optional]
-
-Env vars:
-- OPENAI_API_KEY required for interactive refinement and any LLM mode enabled
-- OPENAI_MODEL default: gpt-4o-mini
-- OPENAI_TEMPERATURE default: 0.2
-
-Feature flags:
-- LLM_SELECT_PER_CONSTRUCT default: 1       (use LLM to choose best library candidate per construct)
-- LLM_SELECT_ALWAYS default: 0              (if 1, always call LLM selection even if heuristic confident)
-- LLM_REWRITE_SELECTED default: 1           (rewrite the chosen question to match site/category/goal)
-- LLM_FALLBACK_ON_MISSING default: 1        (generate a question if zero candidates for construct)
-- AUTO_GENERATE_L2 default: 0               (generate L2 followups if needed)
-- MAX_QUESTIONS default: 5
-- CANDIDATE_K default: 12                   (number of candidates to show the model per construct)
-- SELECT_MARGIN default: 4                  (if best_score - second_best_score >= margin, skip LLM selection unless ALWAYS)
-- STRICT_DEPHARMA default: 1                (adds "remove healthcare/pharma terms" guidance during rewrites)
-
-Run:
-  python survey_builder_backbone_arrival_v10_llm_selection_openai_interactive.py
-
-Requires:
-  pip install pandas openpyxl pydantic python-dotenv openai
-"""
-
 import os
 import json
 import re
@@ -74,6 +34,18 @@ DROP_LIBRARY_CONDITIONS_FOR_CONSTRUCTS = {
     "trigger",
 }
 
+# -------------------
+# L2 POLICY
+# -------------------
+L2_POLICY = os.getenv("L2_POLICY", "user").strip().lower()
+# allowed: "off", "user", "auto"
+# - off: do not plan or add L2
+# - user: plan suggestions only; user adds via interactive command
+# - auto: auto-add only when plan is strong (high confidence)
+L2_AUTO_CONFIDENCE = float(os.getenv("L2_AUTO_CONFIDENCE", "0.87"))
+L2_MAX_DISTINCT = int(os.getenv("L2_MAX_DISTINCT", "2"))
+
+
 def _get_setting(name: str, default: str) -> str:
     try:
         import streamlit as st
@@ -81,6 +53,7 @@ def _get_setting(name: str, default: str) -> str:
         return str(v) if v is not None else os.getenv(name, default)
     except Exception:
         return os.getenv(name, default)
+
 
 MODEL = _get_setting("OPENAI_MODEL", "gpt-4o-mini")
 TEMP = float(_get_setting("OPENAI_TEMPERATURE", "0.2"))
@@ -208,6 +181,8 @@ QuestionType = Literal[
     "OpenText",
 ]
 
+
+
 class OptionSuggestions(BaseModel):
     candidates: List[str] = Field(min_length=5)
     notes: str = ""
@@ -239,10 +214,12 @@ class SelectionDecision(BaseModel):
     why: str = Field(min_length=3)
     confidence: float = Field(ge=0.0, le=1.0, default=0.7)
 
+
 class IntentDraft(BaseModel):
     question_text: str = Field(min_length=5)
     question_type: QuestionType
     answer_options: List[str] = Field(default_factory=list)
+
 
 class AudienceFollowupPlan(BaseModel):
     enabled: bool = Field(default=False)
@@ -252,6 +229,21 @@ class AudienceFollowupPlan(BaseModel):
     answer_options: List[str] = Field(default_factory=list)
     why: str = Field(default="")
     confidence: float = Field(ge=0.0, le=1.0, default=0.7)
+
+
+class L2QuestionDraft(BaseModel):
+    trigger_answer_keys: List[str] = Field(min_length=1)
+    question_text: str = Field(min_length=5)
+    question_type: QuestionType
+    answer_options: List[str] = Field(default_factory=list)
+    why: str = Field(min_length=3)
+
+
+class L2Plan(BaseModel):
+    enabled: bool = False
+    overall_why: str = ""
+    confidence: float = Field(ge=0.0, le=1.0, default=0.7)
+    drafts: List[L2QuestionDraft] = Field(default_factory=list)
 
 
 def plan_audience_followup_openai(
@@ -452,6 +444,113 @@ def generate_l2_followup_openai(
     return out
 
 
+def plan_l2_followups_openai(
+    client: Any,
+    *,
+    ctx: BuilderContext,
+    parent_construct: str,
+    parent_question_text: str,
+    parent_question_type: str,
+    parent_answer_options: List[Dict[str, str]],  # [{"key","label"}]
+    max_l2_questions: int = 2,
+) -> L2Plan:
+    """
+    Plan (not add) L2 followups:
+    - decides enabled vs disabled
+    - returns 0..max_l2_questions drafts
+    - each draft is gated on a SUBSET of answer keys
+    """
+    constraints = (
+        "- FIRST decide if an L2 follow-up is warranted. If not, set enabled=false.\n"
+        "- L2 must have a clear purpose tied to the survey goal (disambiguation, routing, qualification).\n"
+        "- L2 should be shown only for a SUBSET of answers (trigger_answer_keys).\n"
+        "- Do NOT add L2 for every answer by default.\n"
+        "- Keep L2 answerable in <=10 seconds.\n"
+        "- Avoid analytics/trackable topics.\n"
+        "- If parent is OpenText: generally avoid L2 (enabled=false) unless there's a strong reason.\n"
+        f"- Maximum distinct L2 questions: {max_l2_questions}.\n"
+        "- trigger_answer_keys MUST be chosen from provided keys.\n"
+        "- Prefer closed-ended with 2–6 options; include 'Other' only if it truly helps.\n"
+        "- The L2 must still align with the parent construct (do not drift into a different construct).\n"
+    )
+
+    prompt = (
+        "You are planning optional L2 follow-ups for an on-site Arrival survey.\n"
+        "An L2 follow-up is a conditional question shown ONLY after specific parent answers.\n\n"
+        f"Site category: {ctx.site_category}\n"
+        f"Site purpose: {ctx.site_purpose}\n"
+        f"Survey goal: {ctx.survey_goal}\n\n"
+        f"Parent construct: {parent_construct}\n"
+        f"Parent question: {parent_question_text}\n"
+        f"Parent question type: {parent_question_type}\n"
+        f"Parent answer options (keys must be used):\n{json.dumps(parent_answer_options, ensure_ascii=False, indent=2)}\n\n"
+        f"Constraints:\n{constraints}\n\n"
+        "Return an L2Plan:\n"
+        "- enabled\n"
+        "- overall_why\n"
+        "- confidence\n"
+        "- drafts: list (0..max) of L2QuestionDraft with trigger_answer_keys, question_text, question_type, answer_options, why\n"
+    )
+
+    resp = client.responses.parse(
+        model=MODEL,
+        temperature=0.0,
+        input=[
+            {"role": "system", "content": "You plan reasoned, subset-triggered L2 survey follow-ups."},
+            {"role": "user", "content": prompt},
+        ],
+        text_format=L2Plan,
+    )
+
+    plan = resp.output_parsed
+
+    # Enforce triggers are subset of provided keys
+    allowed = {o["key"] for o in (parent_answer_options or []) if o.get("key")}
+    cleaned: List[L2QuestionDraft] = []
+    for d in (plan.drafts or []):
+        keys = [k for k in (d.trigger_answer_keys or []) if k in allowed]
+        if not keys:
+            continue
+        qt, ao = _ensure_closed_ended(d.question_type, d.answer_options)
+        ao = dedupe_options(ao)[:8]
+        cleaned.append(
+            L2QuestionDraft(
+                trigger_answer_keys=keys,
+                question_text=(d.question_text or "").strip(),
+                question_type=qt,  # type: ignore
+                answer_options=ao,  # type: ignore
+                why=(d.why or "").strip(),
+            )
+        )
+
+    plan.drafts = cleaned  # type: ignore
+    if not plan.drafts:
+        plan.enabled = False  # type: ignore
+    return plan
+
+
+def is_multi_select(qtype: str) -> bool:
+    qt = (qtype or "").strip()
+    return qt in {"MultiSelection", "MultiSelectionWithOther"}
+
+
+def build_l2_condition(parent_var: str, parent_qtype: str, trigger_keys: List[str]) -> dict:
+    """
+    For SingleSelection: use op=in
+    For MultiSelection: use any/contains (safer because stored value is typically list)
+    """
+    trigger_keys = [k for k in trigger_keys if k]
+    if not trigger_keys:
+        return {"all": []}
+
+    if is_multi_select(parent_qtype):
+        # Show L2 if parent selections contain ANY of the trigger keys
+        return {"any": [{"var": parent_var, "op": "contains", "value": k} for k in trigger_keys]}
+
+    # SingleSelection / SingleSelectionWithOther
+    return {"all": [{"var": parent_var, "op": "in", "value": trigger_keys}]}
+
+
 def suggest_answer_options_openai(
     client: Any,
     *,
@@ -487,7 +586,6 @@ def suggest_answer_options_openai(
     )
     cands = [c.strip() for c in resp.output_parsed.candidates if c and c.strip()]
     return dedupe_options(cands)[:16]
-
 
 
 def generate_l1_from_exemplars_openai(
@@ -687,8 +785,10 @@ def slugify(s: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "_", s).strip("_")
     return s or "opt"
 
+
 def _norm_label(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
 
 def dedupe_options(options: List[str]) -> List[str]:
     seen = set()
@@ -703,6 +803,7 @@ def dedupe_options(options: List[str]) -> List[str]:
         seen.add(n)
         out.append(t)
     return out
+
 
 def build_option_dicts(slot: str, labels: List[str]) -> List[Dict[str, str]]:
     labels = dedupe_options(labels)
@@ -1059,28 +1160,28 @@ def should_call_llm_selection(
 # -------------------
 # CONSTRUCT POLICY (DETERMINISTIC FLOW)
 # -------------------
-
-LLM_PLAN_CONSTRUCTS = str(os.getenv("LLM_PLAN_CONSTRUCTS", "1")).strip().lower() in {"1","true","yes","y"}
+LLM_PLAN_CONSTRUCTS = str(os.getenv("LLM_PLAN_CONSTRUCTS", "1")).strip().lower() in {"1", "true", "yes", "y"}
 
 NEGATION_PATTERNS = {
-  "journey_stage": [
-    "don't ask journey", "do not ask journey", "no journey stage", "skip journey", "avoid journey stage",
-    "don't include journey", "exclude journey", "no need to ask journey", "measure satisfaction only"
-  ],
-  "prior_knowledge": [
-    "don't ask familiarity", "skip prior knowledge", "avoid familiarity",
-    "don't ask prior knowledge", "exclude prior knowledge"
-  ],
-  "trigger": [
-    "don't ask trigger", "skip trigger", "avoid trigger",
-    "don't ask what prompted", "exclude trigger"
-  ],
+    "journey_stage": [
+        "don't ask journey", "do not ask journey", "no journey stage", "skip journey", "avoid journey stage",
+        "don't include journey", "exclude journey", "no need to ask journey", "measure satisfaction only"
+    ],
+    "prior_knowledge": [
+        "don't ask familiarity", "skip prior knowledge", "avoid familiarity",
+        "don't ask prior knowledge", "exclude prior knowledge"
+    ],
+    "trigger": [
+        "don't ask trigger", "skip trigger", "avoid trigger",
+        "don't ask what prompted", "exclude trigger"
+    ],
 }
 
 
 def _has_any(text: str, *phrases: str) -> bool:
     t = (text or "").lower()
     return any(p in t for p in phrases)
+
 
 def is_negated(goal: str, construct: str) -> bool:
     g = (goal or "").lower()
@@ -1129,7 +1230,7 @@ def plan_constructs(ctx: BuilderContext, client: Optional[Any] = None) -> Dict[s
         reasons[c] = "required_construct"
 
     # ---- OPTIONALS: start with heuristics ----
-    want_journey = _has_any(goal, *GOAL_SIGNALS["journey_stage"]) or cat in {"education","ecommerce","saas","content","university"}
+    want_journey = _has_any(goal, *GOAL_SIGNALS["journey_stage"]) or cat in {"education", "ecommerce", "saas", "content", "university"}
     want_knowledge = _has_any(goal, *GOAL_SIGNALS["prior_knowledge"])
     want_trigger = _has_any(goal, *GOAL_SIGNALS["trigger"])
 
@@ -1173,7 +1274,7 @@ def plan_constructs(ctx: BuilderContext, client: Optional[Any] = None) -> Dict[s
     # Order + cap
     order = ["audience_identity", "journey_stage", "purpose_intent", "prior_knowledge", "trigger"]
     ordered = [x for x in order if any(p["construct"] == x for p in plan)]
-    new_plan = [{"construct": c, "required": (c in {"audience_identity","purpose_intent"})} for c in ordered]
+    new_plan = [{"construct": c, "required": (c in {"audience_identity", "purpose_intent"})} for c in ordered]
 
     # Backfill to reach MIN_QUESTIONS (unless explicitly negated)
     if len(new_plan) < MIN_QUESTIONS:
@@ -1187,16 +1288,14 @@ def plan_constructs(ctx: BuilderContext, client: Optional[Any] = None) -> Dict[s
             new_plan.append({"construct": c, "required": False})
             reasons.setdefault(c, "backfilled_to_meet_min_questions")
 
-
     while len(new_plan) > MAX_QUESTIONS:
-        idx = next((i for i in range(len(new_plan)-1, -1, -1) if not new_plan[i]["required"]), None)
+        idx = next((i for i in range(len(new_plan) - 1, -1, -1) if not new_plan[i]["required"]), None)
         if idx is None:
             break
         removed = new_plan.pop(idx)
         reasons[removed["construct"]] = f"dropped_by_max_questions_{MAX_QUESTIONS}"
 
     return {"constructs": new_plan, "reasons": reasons, "max_questions": MAX_QUESTIONS}
-
 
 
 # -------------------
@@ -1306,14 +1405,6 @@ def _maybe_rewrite_selected_item(it: SurveyItem, ctx: BuilderContext, client: Op
         return any(p.lower() in t for p in phrases)
 
     # --- Construct-specific guardrails ---
-    AUDIENCE_BAD = [
-        "purpose", "information are you looking", "what are you looking for",
-        "what are you here to", "what brought you", "why are you", "intent",
-    ]
-    AUDIENCE_GOOD = [
-        "describes you", "best describes you", "which best describes you", "your role", "you are",
-    ]
-
     PURPOSE_BAD = [
         "which best describes you", "your role", "who are you", "i am a", "i'm a",
     ]
@@ -1423,31 +1514,6 @@ def _maybe_rewrite_selected_item(it: SurveyItem, ctx: BuilderContext, client: Op
             it.answer_options = out_opts
 
 
-    # ==========================
-    # 3) FINAL SAFETY REVERSION
-    # ==========================
-    if not it.question_text or len(it.question_text.strip()) < 5:
-        it.question_text = orig_q
-
-    # If we somehow ended with no options on a closed-ended Q, revert
-    if it.question_type != "OpenText":
-        cur_labels = [o.label for o in (it.answer_options or [])]
-        if len(cur_labels) < 2 and orig_opt_labels:
-            used = set()
-            out_opts: List[AnswerOption] = []
-            for lab in orig_opt_labels[:8]:
-                base = canonical_option_key(it.slot, lab)
-                k = base
-                i = 2
-                while k in used:
-                    k = f"{base}_{i}"
-                    i += 1
-                used.add(k)
-                out_opts.append(AnswerOption(key=k, label=lab))
-            it.answer_options = out_opts
-
-
-
 def _llm_fallback_item(
     ctx: BuilderContext,
     client: Any,
@@ -1468,6 +1534,20 @@ def _llm_fallback_item(
     )
     qt, ao = _ensure_closed_ended(draft.question_type, draft.answer_options)
     ao = dedupe_options(ao)
+
+    # ensure unique keys
+    used = set()
+    opts: List[AnswerOption] = []
+    for lab in ao[:8]:
+        base = canonical_option_key(slot, lab)
+        k = base
+        i = 2
+        while k in used:
+            k = f"{base}_{i}"
+            i += 1
+        used.add(k)
+        opts.append(AnswerOption(key=k, label=lab))
+
     return SurveyItem(
         id=str(qnum),
         module_key=construct,
@@ -1478,7 +1558,7 @@ def _llm_fallback_item(
         question_id=f"llm_fallback::{slot}::{level}",
         question_type=qt,
         question_text=draft.question_text,
-        answer_options=[AnswerOption(key=canonical_option_key(slot, o), label=o) for o in ao],
+        answer_options=opts,
         display_condition_json=None,
         display_condition="",
         ai_actions={"draft": True, "fallback_generated": True, "generated_by": {"provider": "openai", "model": MODEL}},
@@ -1580,7 +1660,7 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
     - For NON-PHARMA: LLM-draft audience_identity (question + options) because library is pharma-only.
     - Adds an optional, LLM-planned Audience follow-up (role/relationship refinement) inserted
       immediately after audience_identity (never last).
-    - Keeps legacy Pharma-only HCP profile behavior (and its L2 logic) but prevents it from appearing for non-Pharma.
+    - Keeps legacy Pharma-only HCP profile behavior but prevents it from appearing for non-Pharma.
     - Ensures anything stored in payload/meta/ai_actions is JSON-serializable (no Pydantic objects).
     """
 
@@ -1615,6 +1695,19 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
 
         slot_name = "1b_Audience_Profile"
 
+        # unique keys
+        used = set()
+        opts: List[AnswerOption] = []
+        for lab in ao[:8]:
+            base = canonical_option_key(slot_name, lab)
+            k = base
+            i = 2
+            while k in used:
+                k = f"{base}_{i}"
+                i += 1
+            used.add(k)
+            opts.append(AnswerOption(key=k, label=lab))
+
         return SurveyItem(
             id=str(qnum),
             module_key="audience_followup",
@@ -1625,7 +1718,7 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
             question_id="llm_followup::audience",
             question_type=qt,
             question_text=str(getattr(followup_plan, "question_text", "") or "").strip(),
-            answer_options=[AnswerOption(key=canonical_option_key(slot_name, x), label=x) for x in ao],
+            answer_options=opts,
             display_condition_json=cond,
             display_condition="",
             ai_actions={
@@ -1646,7 +1739,7 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
         since the library is pharma-only.
         """
         if client is None:
-            # Fall back to existing library item if no client
+            # Fall back to missing template if no client
             return SurveyItem(
                 id=str(qnum),
                 module_key="audience_identity",
@@ -1675,6 +1768,18 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
         qt, ao = _ensure_closed_ended(draft.question_type, draft.answer_options)
         ao = dedupe_options(ao)
 
+        used = set()
+        opts: List[AnswerOption] = []
+        for lab in ao[:8]:
+            base = canonical_option_key(slot, lab)
+            k = base
+            i = 2
+            while k in used:
+                k = f"{base}_{i}"
+                i += 1
+            used.add(k)
+            opts.append(AnswerOption(key=k, label=lab))
+
         return SurveyItem(
             id=str(qnum),
             module_key="audience_identity",
@@ -1685,7 +1790,7 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
             question_id=f"llm_audience::{slot}::{level}",
             question_type=qt,
             question_text=(draft.question_text or "").strip(),
-            answer_options=[AnswerOption(key=canonical_option_key(slot, x), label=x) for x in ao],
+            answer_options=opts,
             display_condition_json=None,
             display_condition="",
             ai_actions={
@@ -1715,7 +1820,7 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
 
         slot, lvl = SLOT_LEVEL_BY_CONSTRUCT[construct]
 
-        # ✅ KEY CHANGE: audience_identity for non-Pharma is LLM-generated (bypass pharma-only library)
+        # ✅ audience_identity for non-Pharma is LLM-generated (bypass pharma-only library)
         if construct == "audience_identity" and not is_pharma:
             it = _draft_audience_identity_non_pharma(qnum, slot=slot, level=lvl)
             items.append(it)
@@ -1739,8 +1844,87 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
         if it.ai_actions.get("missing_template") and LLM_FALLBACK_ON_MISSING and client is not None:
             it = _llm_fallback_item(ctx, client, construct=construct, qnum=qnum, slot=slot, level=lvl)
 
-        # Optional rewrite (bounded, with your updated guardrails)
+        # Optional rewrite (bounded, with guardrails)
         _maybe_rewrite_selected_item(it, ctx, client)
+
+        # -----------------------
+        # L2 SUGGESTIONS (plan-only by default)
+        # -----------------------
+        if client is not None and L2_POLICY in {"user", "auto"}:
+            try:
+                if it.level == "L1" and it.question_type != "OpenText" and it.answer_options:
+                    parent_opts = [{"key": o.key, "label": o.label} for o in (it.answer_options or [])]
+                    l2_plan = plan_l2_followups_openai(
+                        client,
+                        ctx=ctx,
+                        parent_construct=it.construct,
+                        parent_question_text=it.question_text,
+                        parent_question_type=it.question_type,
+                        parent_answer_options=parent_opts,
+                        max_l2_questions=L2_MAX_DISTINCT,
+                    )
+                    it.ai_actions["l2_suggestions"] = l2_plan.model_dump() if hasattr(l2_plan, "model_dump") else l2_plan.dict()
+
+                    # Auto-add only when explicitly configured and strong
+                    if (
+                        L2_POLICY == "auto"
+                        and getattr(l2_plan, "enabled", False)
+                        and float(getattr(l2_plan, "confidence", 0.0)) >= L2_AUTO_CONFIDENCE
+                        and (l2_plan.drafts or [])
+                    ):
+                        # Add the first draft automatically (conservative)
+                        d0 = (l2_plan.drafts or [])[0]
+                        parent_var = var_name_for_slot(it.slot, it.level)
+                        cond = build_l2_condition(parent_var, it.question_type, list(d0.trigger_answer_keys))
+                        qt, ao = _ensure_closed_ended(d0.question_type, d0.answer_options)
+                        ao = dedupe_options(ao)
+
+                        items.append(it)  # ensure parent is appended before L2
+                        qnum += 1
+
+                        # unique keys
+                        used = set()
+                        opts: List[AnswerOption] = []
+                        if qt != "OpenText":
+                            for lab in ao[:8]:
+                                base = canonical_option_key(it.slot, lab)
+                                k = base
+                                i = 2
+                                while k in used:
+                                    k = f"{base}_{i}"
+                                    i += 1
+                                used.add(k)
+                                opts.append(AnswerOption(key=k, label=lab))
+
+                        items.append(
+                            SurveyItem(
+                                id=str(qnum),
+                                module_key="l2_followup",
+                                construct="l2_followup",
+                                slot=it.slot,
+                                phase="Arrival",
+                                level="L2",
+                                question_id=f"llm_l2::{it.slot}::{slugify(','.join(d0.trigger_answer_keys))}",
+                                question_type=qt,
+                                question_text=d0.question_text,
+                                answer_options=opts,
+                                display_condition_json=cond,
+                                display_condition="",
+                                ai_actions={
+                                    "draft": True,
+                                    "generated_by": {"provider": "openai", "model": MODEL},
+                                    "why": d0.why,
+                                    "trigger_answer_keys": list(d0.trigger_answer_keys),
+                                    "auto_added": True,
+                                },
+                            )
+                        )
+                        qnum += 1
+                        continue  # we already appended parent + l2
+
+            except Exception as e:
+                it.ai_actions.setdefault("warnings", [])
+                it.ai_actions["warnings"].append({"type": "l2_planning_failed", "error": str(e)})
 
         items.append(it)
         qnum += 1
@@ -1780,12 +1964,16 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
                     {"type": "audience_followup_planning_failed", "error": str(e)}
                 )
 
-    # 3) Legacy: Pharma-only HCP profile block (unchanged, but ONLY runs for Pharma)
+    # 3) Legacy: Pharma-only HCP profile block (fixed)
     if is_pharma:
         audience_item = next((x for x in items if x.construct == "audience_identity"), None)
-        need_hcp_profile = False
-        if audience_item and audience_item.answer_options:
-            need_hcp_profile = any(o.key == "hcp" for o in audience_item.answer_options)
+
+        # Add HCP profile only if the audience question actually has an "hcp" key
+        need_hcp_profile = bool(
+            audience_item
+            and audience_item.answer_options
+            and any((o.key or "").strip() == "hcp" for o in (audience_item.answer_options or []))
+        )
 
         if need_hcp_profile:
             slot, lvl = SLOT_LEVEL_BY_CONSTRUCT["hcp_profile"]
@@ -1816,7 +2004,7 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
             items.append(hcp_l1)
             qnum += 1
 
-            # HCP L2 plan + deterministic adds (optional)
+            # HCP L2: library matching + trace only (no auto L2 generation unless AUTO_GENERATE_L2 is enabled)
             parent_var = var_name_for_slot("1b_HCP_Profile", "L1")
 
             l2_1b = df[
@@ -1856,37 +2044,8 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
                         qnum += 1
 
                 if res["mode"] == "llm_needed" and AUTO_GENERATE_L2:
-                    if client is None:
-                        raise RuntimeError("AUTO_GENERATE_L2=1 but no OpenAI client available.")
-                    draft = generate_l2_followup_openai(
-                        client,
-                        parent_question_text=hcp_l1.question_text,
-                        parent_answer_label=opt.label,
-                        parent_signal="HCP_Profile",
-                        site_purpose=ctx.site_purpose,
-                        survey_goal=ctx.survey_goal,
-                        site_category=ctx.site_category,
-                    )
-                    cond = {"all": [{"var": parent_var, "op": "equals", "value": opt.key}]}
-                    qt, ao = _ensure_closed_ended(draft.question_type, draft.answer_options)
-                    items.append(
-                        SurveyItem(
-                            id=str(qnum),
-                            module_key="hcp_profile_l2",
-                            construct="hcp_profile_l2",
-                            slot="2b_HCP_Profile",
-                            phase="Arrival",
-                            level="L2",
-                            question_id=f"llm_draft::2b_HCP_Profile::{opt.key}",
-                            question_type=qt,
-                            question_text=draft.question_text,
-                            answer_options=[AnswerOption(key=slugify(o), label=o) for o in ao],
-                            display_condition_json=cond,
-                            display_condition="",
-                            ai_actions={"draft": True, "generated_by": {"provider": "openai", "model": MODEL}},
-                        )
-                    )
-                    qnum += 1
+                    # Intentionally not auto-generating here (legacy path stays deterministic)
+                    continue
 
             hcp_l1.ai_actions["l2_followups"] = {
                 "enabled": True,
@@ -1937,7 +2096,6 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
             {
                 **{k: v for k, v in asdict(it).items() if k != "answer_options"},
                 "answer_options": [asdict(o) for o in it.answer_options],
-                # ensure ai_actions never contains pydantic objects
                 "ai_actions": _to_plain(asdict(it).get("ai_actions", {})),
             }
             for it in items
@@ -1945,7 +2103,6 @@ def build_arrival(df: pd.DataFrame, ctx: BuilderContext, client: Optional[Any] =
     }
 
     return payload
-
 
 
 # -------------------
@@ -2024,7 +2181,11 @@ EDIT OPTIONS (no AI)
   reorderopts <qid> <idx1,idx2,...>        (1-based)
 
 CONDITIONAL (AI)
-  l2 <parent_qid> <answer_key>
+  l2plan <parent_qid>                      (generate/print L2 suggestions for parent)
+  l2add <parent_qid> <draft_index>         (add an L2 from the printed plan; draft_index is 1-based)
+  l2 <parent_qid> <key1,key2,...>          (interactive: choose keys -> enter intent -> AI drafts -> auto-add)
+  l2 <parent_qid> <key1,key2,...> | <question_type> | <intent>
+                                          (non-interactive: SingleSelection/MultiSelection/OpenText)
 
 ADD QUESTION (no AI)
   addq <after_qid|end> <slot> <level> <question_type> | <question_text> | <opt1;opt2;...>
@@ -2036,6 +2197,7 @@ SYSTEM
   save
   quit
 """.strip()
+
 
 def _split_pipe(cmd: str, expected_parts: int) -> Optional[List[str]]:
     parts = [p.strip() for p in cmd.split("|")]
@@ -2059,6 +2221,7 @@ def _find_item(payload: Dict[str, Any], qid: str) -> Optional[Dict[str, Any]]:
 
 def _clone_item(it: Dict[str, Any]) -> Dict[str, Any]:
     return copy.deepcopy(it)
+
 
 def _dedupe_labels_preserve_order(labels: List[str]) -> List[str]:
     seen = set()
@@ -2094,7 +2257,6 @@ def _set_options_from_labels(it: Dict[str, Any], labels: List[str]) -> None:
     it["answer_options"] = out
 
 
-
 def _print_update(before_it: Dict[str, Any], after_it: Dict[str, Any]) -> None:
     print("\n--- UPDATE APPLIED ---")
     print(f"Q{after_it.get('id')} [{after_it.get('construct')}] [{after_it.get('slot')}/{after_it.get('level')}]")
@@ -2110,6 +2272,127 @@ def _print_update(before_it: Dict[str, Any], after_it: Dict[str, Any]) -> None:
         print("  BEFORE:", bopts)
         print("  AFTER: ", aopts)
     print("----------------------\n")
+
+
+def ai_generate_l2_draft(
+    client,
+    *,
+    ctx,
+    parent_it: Dict[str, Any],
+    trigger_labels: List[str],
+    user_intent: str,
+    desired_qtype: str,
+):
+    """
+    Use existing rewrite_* helpers to generate an L2 question + options draft.
+    Returns: (question_text: str, options: List[str])
+    """
+    parent_q = (parent_it.get("question_text") or "").strip()
+    trig = ", ".join(trigger_labels) if trigger_labels else ""
+
+    # 1) Generate L2 question text
+    draft_l2 = (
+        f"Follow-up question when user selected: {trig}. "
+        f"Parent question: {parent_q}. "
+        f"User wants: {user_intent}."
+    )
+
+    q_instruction = (
+        "Write ONE concise follow-up survey question that is directly relevant to the selected answer(s). "
+        "Avoid pharma/healthcare wording unless site category is Pharma. "
+        "Keep it short and clear. "
+        f"Desired question type: {desired_qtype}. "
+        "Do not mention 'selected answer' explicitly. "
+        "Do not reference internal keys."
+    )
+
+    l2_text = rewrite_question_text_openai(
+        client,
+        site_purpose=ctx.site_purpose,
+        survey_goal=ctx.survey_goal,
+        site_category=ctx.site_category,
+        original_question_text=draft_l2,
+        instruction=q_instruction,
+    )
+
+    # 2) Generate options if closed-ended
+    if desired_qtype == "OpenText":
+        return l2_text.strip(), []
+
+    # seed options to guide the model
+    seed = ["Option A", "Option B", "Other"]
+
+    opt_instruction = (
+        "Generate answer options for the follow-up question. "
+        "Return short option labels only. "
+        "Make them mutually exclusive where possible. "
+        "Include 'Other' only if useful. "
+        f"Follow-up question: {l2_text}"
+    )
+
+    l2_opts = rewrite_answer_options_openai(
+        client,
+        site_purpose=ctx.site_purpose,
+        survey_goal=ctx.survey_goal,
+        site_category=ctx.site_category,
+        question_text=l2_text,
+        original_options=seed,
+        instruction=opt_instruction,
+        keep_other_if_present=True,
+    )
+
+    # dedupe/cap
+    l2_opts = _dedupe_labels_preserve_order([str(x) for x in (l2_opts or [])])[:8]
+    return l2_text.strip(), l2_opts
+
+
+def build_l2_item_from_draft(
+    *,
+    parent_item: Dict[str, Any],
+    draft: Dict[str, Any],
+    new_id: str,
+) -> Dict[str, Any]:
+    pslot = str(parent_item.get("slot") or "")
+    plevel = str(parent_item.get("level") or "L1")
+    parent_var = var_name_for_slot(pslot, plevel)
+
+    parent_qtype = normalize_qtype(str(parent_item.get("question_type") or "SingleSelection"))
+    trigger_keys = [str(x).strip() for x in (draft.get("trigger_answer_keys") or []) if str(x).strip()]
+
+    cond = build_l2_condition(parent_var, parent_qtype, trigger_keys)
+
+    qtype = normalize_qtype(str(draft.get("question_type") or "SingleSelection"))
+    qtext = str(draft.get("question_text") or "").strip()
+    opts = list(draft.get("answer_options") or [])
+
+    qtype, opts = _ensure_closed_ended(qtype, opts)
+
+    item = {
+        "id": str(new_id),
+        "module_key": "l2_followup",
+        "construct": "l2_followup",
+        "slot": pslot,
+        "phase": "Arrival",
+        "level": "L2",
+        "question_id": f"llm_l2::{pslot}::{slugify(','.join(trigger_keys))}",
+        "question_type": qtype,
+        "question_text": qtext,
+        "answer_options": [],
+        "display_condition_json": cond,
+        "display_condition": "",
+        "ai_actions": {
+            "draft": True,
+            "source": "l2_user_requirements_ui",
+            "trigger_answer_keys": trigger_keys,
+            "why": str(draft.get("why") or ""),
+        },
+    }
+
+    if qtype != "OpenText":
+        opts = _dedupe_labels_preserve_order([str(x) for x in opts])
+        _set_options_from_labels(item, opts[:8])
+
+    return item
 
 
 def interactive_loop(payload: Dict[str, Any], ctx: BuilderContext, client: Any) -> Dict[str, Any]:
@@ -2399,64 +2682,109 @@ def interactive_loop(payload: Dict[str, Any], ctx: BuilderContext, client: Any) 
             print("✅ Added LLM draft question.")
             continue
 
+        # ==========================
+        # UPDATED L2 COMMAND (NEW)
+        # ==========================
         if low.startswith("l2 "):
-            parts = cmd.split()
-            if len(parts) < 3:
-                print("Usage: l2 <parent_qid> <answer_key>")
-                continue
-            parent_qid = parts[1].strip()
-            answer_key = parts[2].strip()
+            # Supports:
+            #   l2 <parent_qid> <key1,key2,...>
+            #   l2 <parent_qid> <key1,key2,...> | <question_type> | <intent>
+            #
+            # If pipe form not used, we prompt interactively for intent + type.
+            pipe_parts = _split_pipe(cmd, 3)
+            if pipe_parts:
+                head, qtype_part, intent_part = pipe_parts[0], pipe_parts[1], pipe_parts[2]
+                hp = head.split()
+                if len(hp) < 3:
+                    print("Usage: l2 <parent_qid> <key1,key2,...> | <question_type> | <intent>")
+                    continue
+                parent_qid = hp[1].strip()
+                keys_blob = hp[2].strip()
+                desired_qtype = (qtype_part or "").strip() or "SingleSelection"
+                user_intent = (intent_part or "").strip()
+            else:
+                parts = cmd.split()
+                if len(parts) < 3:
+                    print("Usage: l2 <parent_qid> <key1,key2,...>")
+                    continue
+                parent_qid = parts[1].strip()
+                keys_blob = parts[2].strip()
+                desired_qtype = ""
+                user_intent = ""
+
             parent = _find_item(payload, parent_qid)
             if not parent:
                 print(f"No question found with id={parent_qid}")
                 continue
 
             parent_opts = parent.get("answer_options", []) or []
-            ans_label = None
-            for o in parent_opts:
-                if isinstance(o, dict) and str(o.get("key")) == answer_key:
-                    ans_label = o.get("label")
-                    break
-            if not ans_label:
-                print(f"Answer key '{answer_key}' not found in Q{parent_qid}")
-                print("Available keys:", [o.get("key") for o in parent_opts if isinstance(o, dict)])
+            key_to_label = {o.get("key"): o.get("label") for o in parent_opts if isinstance(o, dict)}
+            trigger_keys = [k.strip() for k in keys_blob.split(",") if k.strip()]
+            trigger_keys = [k for k in trigger_keys if k in key_to_label]
+
+            if not trigger_keys:
+                print("No valid answer keys provided.")
+                print("Available keys:", list(key_to_label.keys()))
                 continue
 
-            pslot = str(parent.get("slot") or "")
-            plevel = str(parent.get("level") or "L1")
-            parent_var = var_name_for_slot(pslot, plevel)
+            # Step 1: collect intent + type if not provided
+            if not user_intent:
+                print("\nWhat do you want this L2 follow-up to ask? (free text)")
+                user_intent = input("> ").strip()
+                if not user_intent:
+                    print("Canceled: intent is required.")
+                    continue
 
-            draft = generate_l2_followup_openai(
+            if not desired_qtype:
+                print("\nChoose L2 question type: SingleSelection / MultiSelection / OpenText  [SingleSelection]")
+                desired_qtype = (input("> ").strip() or "SingleSelection").strip()
+
+            # Normalize type
+            desired_qtype_norm = desired_qtype.strip()
+            if desired_qtype_norm.lower() in {"single", "singleselect", "single_selection"}:
+                desired_qtype_norm = "SingleSelection"
+            if desired_qtype_norm.lower() in {"multi", "multiselect", "multi_selection"}:
+                desired_qtype_norm = "MultiSelection"
+            if desired_qtype_norm.lower() in {"open", "text", "opentext"}:
+                desired_qtype_norm = "OpenText"
+            if desired_qtype_norm not in {"SingleSelection", "MultiSelection", "OpenText"}:
+                print("Invalid question_type. Use: SingleSelection / MultiSelection / OpenText")
+                continue
+
+            # Step 2: call AI to draft question + options
+            selected_labels = [key_to_label[k] for k in trigger_keys]
+            l2_text, l2_opts = ai_generate_l2_draft(
                 client,
-                parent_question_text=parent.get("question_text", ""),
-                parent_answer_label=ans_label,
-                parent_signal="HCP_Profile" if "HCP" in pslot else "Purpose",
-                site_purpose=ctx.site_purpose,
-                survey_goal=ctx.survey_goal,
-                site_category=ctx.site_category,
+                ctx=ctx,
+                parent_it=parent,
+                trigger_labels=selected_labels,
+                user_intent=user_intent,
+                desired_qtype=desired_qtype_norm,
             )
-            cond = {"all": [{"var": parent_var, "op": "equals", "value": answer_key}]}
-            qt, ao = _ensure_closed_ended(draft.question_type, draft.answer_options)
 
-            new_item = {
-                "id": "TBD",
-                "module_key": "llm_generated_l2",
-                "construct": "llm_generated_l2",
-                "slot": "2b_HCP_Profile" if "HCP" in pslot else "3_Goal",
-                "phase": "Arrival",
-                "level": "L2",
-                "question_id": f"llm_draft::{pslot}::{answer_key}",
-                "question_type": qt,
-                "question_text": draft.question_text,
-                "display_condition_json": cond,
-                "display_condition": "",
-                "ai_actions": {"draft": True, "generated_by": {"provider": "openai", "model": MODEL}},
-                "answer_options": [] if qt == "OpenText" else [],
+            # Build a draft dict compatible with build_l2_item_from_draft
+            draft = {
+                "trigger_answer_keys": trigger_keys,
+                "question_text": l2_text,
+                "question_type": desired_qtype_norm,
+                "answer_options": l2_opts,
+                "why": f"user_intent: {user_intent}",
             }
-            if qt != "OpenText":
-                _set_options_from_labels(new_item, ao)
 
-            items = payload.get("items", [])
+            # Step 3: build the L2 item and append
+            items = payload.get("items", []) or []
+            new_item = build_l2_item_from_draft(
+                qnum=len(items) + 1,
+                parent_item=parent,
+                draft=draft,
+            )
+
+            # Tag it clearly as the simplified interactive flow
+            new_item.setdefault("ai_actions", {})
+            new_item["ai_actions"]["mode"] = "user_intent_then_ai"
+            new_item["ai_actions"]["user_intent"] = user_intent
+            new_item["ai_actions"]["desired_qtype"] = desired_qtype_norm
+
             items.append(new_item)
             for i, it2 in enumerate(items, start=1):
                 it2["id"] = str(i)
@@ -2465,8 +2793,109 @@ def interactive_loop(payload: Dict[str, Any], ctx: BuilderContext, client: Any) 
             print("✅ Added L2 draft question.")
             continue
 
-        print("Unknown command. Type 'help' to see commands.")
+        if low.startswith("l2plan "):
+            parts = cmd.split()
+            if len(parts) != 2:
+                print("Usage: l2plan <parent_qid>")
+                continue
+            parent_qid = parts[1].strip()
+            parent = _find_item(payload, parent_qid)
+            if not parent:
+                print(f"No question found with id={parent_qid}")
+                continue
 
+            # If no stored suggestions, generate now
+            sug = (parent.get("ai_actions") or {}).get("l2_suggestions")
+            if not sug and client is not None:
+                try:
+                    parent_opts = [{"key": o.get("key"), "label": o.get("label")} for o in (parent.get("answer_options") or []) if isinstance(o, dict)]
+                    if not parent_opts:
+                        print("Parent has no answer options; cannot plan L2.")
+                        continue
+                    plan = plan_l2_followups_openai(
+                        client,
+                        ctx=ctx,
+                        parent_construct=str(parent.get("construct") or ""),
+                        parent_question_text=str(parent.get("question_text") or ""),
+                        parent_question_type=str(parent.get("question_type") or "SingleSelection"),
+                        parent_answer_options=parent_opts,
+                        max_l2_questions=L2_MAX_DISTINCT,
+                    )
+                    sug = plan.model_dump() if hasattr(plan, "model_dump") else plan.dict()
+                    parent.setdefault("ai_actions", {})
+                    parent["ai_actions"]["l2_suggestions"] = sug
+                except Exception as e:
+                    print("Failed to generate L2 plan:", str(e))
+                    continue
+
+            if not sug:
+                print("No L2 suggestions available.")
+                continue
+
+            enabled = bool(sug.get("enabled", False))
+            print("\n--- L2 SUGGESTIONS ---")
+            print(f"enabled={enabled}  confidence={sug.get('confidence')}  why={sug.get('overall_why','')}")
+            drafts = sug.get("drafts", []) or []
+            if not drafts:
+                print("(no drafts)")
+                continue
+            for i, d in enumerate(drafts, start=1):
+                print(f"\n[{i}] triggers={d.get('trigger_answer_keys')}")
+                print("    why:", d.get("why", ""))
+                print("    Q:", d.get("question_text", ""))
+                print("    type:", d.get("question_type", ""))
+                opts = d.get("answer_options", []) or []
+                for o in opts:
+                    print("     -", o)
+            print("----------------------\n")
+            continue
+
+        if low.startswith("l2add "):
+            parts = cmd.split()
+            if len(parts) != 3:
+                print("Usage: l2add <parent_qid> <draft_index>")
+                continue
+            parent_qid = parts[1].strip()
+            try:
+                draft_idx = int(parts[2]) - 1
+            except Exception:
+                print("draft_index must be an integer (1-based).")
+                continue
+
+            parent = _find_item(payload, parent_qid)
+            if not parent:
+                print(f"No question found with id={parent_qid}")
+                continue
+
+            sug = (parent.get("ai_actions") or {}).get("l2_suggestions") or {}
+            drafts = sug.get("drafts", []) or []
+            if not drafts:
+                print("No L2 drafts found. Run: l2plan <parent_qid>")
+                continue
+            if not (0 <= draft_idx < len(drafts)):
+                print(f"draft_index out of range (1..{len(drafts)})")
+                continue
+
+            draft = drafts[draft_idx]
+            items = payload.get("items", [])
+
+            new_item = build_l2_item_from_draft(
+                qnum=len(items) + 1,
+                parent_item=parent,
+                draft=draft,
+            )
+
+            # Append at end (simple). You could also insert right after parent if you prefer.
+            items.append(new_item)
+
+            for i, it2 in enumerate(items, start=1):
+                it2["id"] = str(i)
+            payload["items"] = items
+
+            print("✅ Added L2 from plan.")
+            continue
+
+        print("Unknown command. Type 'help' to see commands.")
 
 
 # -------------------
