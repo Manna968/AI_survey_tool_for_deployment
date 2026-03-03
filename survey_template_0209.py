@@ -355,6 +355,22 @@ def generate_l1_by_intent_openai(
     out.answer_options = dedupe_options(ao)  # type: ignore
     return out
 
+def normalize_qtype(qtype: str) -> str:
+    qt = (qtype or "").strip()
+    mapping = {
+        "single": "SingleSelection",
+        "singleselection": "SingleSelection",
+        "single_selection": "SingleSelection",
+        "multi": "MultiSelection",
+        "multiselection": "MultiSelection",
+        "multi_selection": "MultiSelection",
+        "opentext": "OpenText",
+        "open_text": "OpenText",
+        "open": "OpenText",
+        "text": "OpenText",
+    }
+    key = re.sub(r"[^a-z_]", "", qt.lower())
+    return mapping.get(key, qt or "SingleSelection")
 
 def make_client() -> Any:
     """
@@ -548,6 +564,8 @@ def build_l2_condition(parent_var: str, parent_qtype: str, trigger_keys: List[st
         return {"any": [{"var": parent_var, "op": "contains", "value": k} for k in trigger_keys]}
 
     # SingleSelection / SingleSelectionWithOther
+    if len(trigger_keys) == 1:
+        return {"all": [{"var": parent_var, "op": "equals", "value": trigger_keys[0]}]}
     return {"all": [{"var": parent_var, "op": "in", "value": trigger_keys}]}
 
 
@@ -2771,12 +2789,13 @@ def interactive_loop(payload: Dict[str, Any], ctx: BuilderContext, client: Any) 
                 "why": f"user_intent: {user_intent}",
             }
 
-            # Step 3: build the L2 item and append
-            items = payload.get("items", []) or []
+            # Step 3: build the L2 item and insert right after parent
+            items = payload.get("items", [])
+
             new_item = build_l2_item_from_draft(
-                qnum=len(items) + 1,
                 parent_item=parent,
                 draft=draft,
+                new_id=str(len(items) + 1),
             )
 
             # Tag it clearly as the simplified interactive flow
@@ -2785,7 +2804,16 @@ def interactive_loop(payload: Dict[str, Any], ctx: BuilderContext, client: Any) 
             new_item["ai_actions"]["user_intent"] = user_intent
             new_item["ai_actions"]["desired_qtype"] = desired_qtype_norm
 
-            items.append(new_item)
+            parent_idx = next(
+                (i for i, it2 in enumerate(items) if str(it2.get("id")) == str(parent_qid)),
+                None,
+            )
+
+            if parent_idx is None:
+                items.append(new_item)
+            else:
+                items.insert(parent_idx + 1, new_item)
+
             for i, it2 in enumerate(items, start=1):
                 it2["id"] = str(i)
             payload["items"] = items
@@ -2880,13 +2908,21 @@ def interactive_loop(payload: Dict[str, Any], ctx: BuilderContext, client: Any) 
             items = payload.get("items", [])
 
             new_item = build_l2_item_from_draft(
-                qnum=len(items) + 1,
                 parent_item=parent,
                 draft=draft,
+                new_id=str(len(items) + 1),
             )
 
-            # Append at end (simple). You could also insert right after parent if you prefer.
-            items.append(new_item)
+            # Insert right after parent
+            parent_idx = next(
+                (i for i, it2 in enumerate(items) if str(it2.get("id")) == str(parent_qid)),
+                None,
+            )
+
+            if parent_idx is None:
+                items.append(new_item)
+            else:
+                items.insert(parent_idx + 1, new_item)
 
             for i, it2 in enumerate(items, start=1):
                 it2["id"] = str(i)
